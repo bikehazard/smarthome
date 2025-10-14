@@ -4,6 +4,15 @@
 #include <WebServer.h>
 #include <PubSubClient.h>
 #include <time.h>
+#include <Arduino.h>
+#include <Wire.h>
+
+// ======================= UART (HardwareSerial) =====================
+#define RX_PIN 16
+#define TX_PIN 17
+#define RE_DE_PIN 19
+#define UART_BAUD 9600
+HardwareSerial uartToSlaveESP(1);
 
 // --- DHT ---
 #define DHTPIN 32
@@ -13,6 +22,8 @@ DHT dht(DHTPIN, DHTTYPE);
 // --- WiFi ---
 const char* ssid = "4M";
 const char* password = "Shxt-313";
+// const char* ssid = "Mnet_0";
+// const char* password = "Vgt15rst";
 
 // --- MQTT (HiveMQ) ---
 const char* mqtt_server = "e492dd1e26cf46eb8faf8bf4c19894e2.s1.eu.hivemq.cloud"; // publiczny broker HiveMQ
@@ -176,34 +187,73 @@ void setupHttpServer() {
   Serial.println("Serwer HTTP uruchomiony");
 }
 
+void initUartToSlave() {  
+  uartToSlaveESP.begin(UART_BAUD, SERIAL_8N1, RX_PIN, TX_PIN);
+  pinMode(RE_DE_PIN, OUTPUT);
+  digitalWrite(RE_DE_PIN, LOW); // Set RE/DE low to receive
+}
+
+void readMS5803FromESP8266(const String &cmd) {
+  // wysyłamy komendę
+  digitalWrite(RE_DE_PIN, HIGH);
+  delayMicroseconds(50);
+  uartToSlaveESP.println(cmd);
+  uartToSlaveESP.flush();
+  delayMicroseconds(100);
+  digitalWrite(RE_DE_PIN, LOW);
+  Serial.println("[ESP32] Send command: " + cmd);
+
+  // wait for response
+  delay(100);  
+
+  if(!uartToSlaveESP.available()) {
+    Serial.println("[ESP8266] No response.");
+    return;
+  }
+
+  // odczytujemy wszystkie linie, które przyszły
+  while (uartToSlaveESP.available()) {
+    String line = uartToSlaveESP.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) {
+      Serial.println("[ESP8266] " + line);
+    }
+  }
+}
+
 void setup() {
+  Serial.println("Initializing...");
   espClient.setInsecure(); // wyłącza weryfikację certyfikatu
 
   Serial.begin(115200);
+  initUartToSlave();
   initTime();
-  dht.begin();
-  connectToWiFi();
-  connectMQTT();
-  setupHttpServer();
+  // dht.begin();
+
+  // connectToWiFi();
+  // connectMQTT();
+  // setupHttpServer();
 }
 
 unsigned long lastMsg = 0; // Move outside loop to retain value between iterations
 
 void loop() {
-  server.handleClient();
-  // maintain MQTT connection
-  client.loop();
-  // reconnect MQTT if connection lost
-  if (!client.connected()) {
-    connectMQTT();
-  }
+  // server.handleClient();
+  // // maintain MQTT connection
+  // client.loop();
+  // // reconnect MQTT if connection lost
+  // if (!client.connected()) {
+  //   connectMQTT();
+  // }
 
-  unsigned long now = millis();
-  // Serial.println("Timestamp: " + String(now) + " diff: " + String(now - lastMsg));
-  if (now - lastMsg > 10000) {  // co 5 sekund
-    lastMsg = now;
-    mqttPublishSensorData();
-  }
+  // unsigned long now = millis();
+  // // Serial.println("Timestamp: " + String(now) + " diff: " + String(now - lastMsg));
+  // if (now - lastMsg > 10000) {  // co 5 sekund
+  //   lastMsg = now;
+  //   mqttPublishSensorData();
+  // }
+
+  readMS5803FromESP8266("ALL");
 
   delay(2000);
 }
