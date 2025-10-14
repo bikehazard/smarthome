@@ -26,16 +26,17 @@ const char* password = "Shxt-313";
 // const char* password = "Vgt15rst";
 
 // --- MQTT (HiveMQ) ---
-const char* mqtt_server = "e492dd1e26cf46eb8faf8bf4c19894e2.s1.eu.hivemq.cloud"; // publiczny broker HiveMQ
+const char* mqtt_server = "e492dd1e26cf46eb8faf8bf4c19894e2.s1.eu.hivemq.cloud"; // public HiveMQ broker
 const int mqtt_port = 8883;
 const char* mqtt_topic = "esp32/dht22";
+const char* mqtt_waterlevel_topic = "esp32/studnia";
 const char* mqtt_user = "esp_user";
 const char* mqtt_password = "Rde11#aqaa";
 
 // --- HTTP server ---
 WebServer server(80);
 
-// --- Funkcje NTP ---
+// --- NTP Functions ---
 void initTime() {
   configTime(3600, 3600, "pool.ntp.org", "time.nist.gov");
 }
@@ -46,7 +47,7 @@ PubSubClient client(espClient);
 String getFormattedTime() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
-    return "Brak czasu (NTP nie działa)";
+    return "No time (NTP not working)";
   }
   char buffer[30];
   strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
@@ -55,7 +56,7 @@ String getFormattedTime() {
 
 void scanWifi() {
   int n = WiFi.scanNetworks();
-  Serial.println("Dostępne sieci WiFi:");
+  Serial.println("Available WiFi networks:");
   for (int i = 0; i < n; ++i) {
     Serial.print(i + 1);
     Serial.print(": ");
@@ -63,17 +64,17 @@ void scanWifi() {
     Serial.print(" (RSSI: ");
     Serial.print(WiFi.RSSI(i));
     Serial.print(" dBm) ");
-    Serial.print((WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "Otwarta" : "Zabezpieczona");
+    Serial.print((WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "Open" : "Secured");
     Serial.println();
   }
   if (n == 0) {
-    Serial.println("Brak dostępnych sieci WiFi");
+    Serial.println("No available WiFi networks");
   }
   Serial.println();
 }
 
 void connectToWiFi() {
-  Serial.print("Łączenie z siecią WiFi: ");
+  Serial.print("Connecting to WiFi: ");
   Serial.println(ssid);
   // WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS);
   WiFi.begin(ssid, password);
@@ -81,28 +82,26 @@ void connectToWiFi() {
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
-    // Serial.print("\n");
-
     scanWifi();
   }
 
   Serial.println("");
-  Serial.println("Połączono z WiFi");
-  Serial.print("Adres IP: ");
+  Serial.println("Connected to WiFi");
+  Serial.print("IP Address: ");
   Serial.println(WiFi.localIP());
 }
 
-// --- Połączenie z MQTT ---
+// --- MQTT Connection ---
 void connectMQTT() {
   client.setServer(mqtt_server, mqtt_port);
   while (!client.connected()) {
-    Serial.print("Łączenie z MQTT...");
+    Serial.print("Connecting to MQTT...");
     if (client.connect("ESP32Client", mqtt_user, mqtt_password)) {
-      Serial.println("połączono!");
+      Serial.println("connected!");
     } else {
-      Serial.print("błąd, rc=");
+      Serial.print("error, rc=");
       Serial.print(client.state());
-      Serial.println(", próba ponownie w 2s");
+      Serial.println(", trying again in 2s");
       delay(2000);
     }
   }
@@ -113,14 +112,14 @@ void mqttPublishSensorData() {
   float hum = dht.readHumidity();
 
   if (isnan(temp) || isnan(hum)) {
-    Serial.println("Błąd odczytu DHT!");
+    Serial.println("DHT read error!");
     return;
   }
 
   long rssi = WiFi.RSSI();
   String datetime = getFormattedTime();
 
-  // Tworzenie JSON
+  // Create JSON
   String now = getFormattedTime();
   String date = now.substring(0, 10);   // "YYYY-MM-DD"
   String time = now.substring(11);      // "HH:MM:SS"
@@ -130,14 +129,52 @@ void mqttPublishSensorData() {
                    ",\"time\":\"" + String(time) + "\"" +
                    ",\"rssi\":" + String(rssi) + "}";
 
-  // Wysyłka do MQTT
+  // Send to MQTT
   if (client.connected()) {
     client.publish(mqtt_topic, payload.c_str());
     Serial.println("Send to MQTT topic: " + String(mqtt_topic));
     Serial.println("Payload: " + payload);
   } else {
-    Serial.println("MQTT niepołączone, próba ponownie...");
-    connectMQTT(); // funkcja do ponownego połączenia
+    Serial.println("MQTT not connected, trying again...");
+    connectMQTT(); // function to reconnect
+  }
+}
+
+float calculateWaterLevel(float pressure) {
+  // Assuming pressure is in mbar and the density of water is 1000 kg/m^3
+  // Water level (in meters) = Pressure (in mbar) / (density of water * g) * 100
+  // where g is the acceleration due to gravity (approximately 9.81 m/s^2)
+  float waterLevel = pressure / (1000 * 9.81); // meters
+  Serial.print("Calculated Water Level: ");
+  Serial.print(waterLevel);
+  Serial.println(" m");
+  return waterLevel;
+}
+
+void mqttPublishWaterLevel(float pressValue) {
+
+  float waterLevel = calculateWaterLevel(pressValue);
+
+  long rssi = WiFi.RSSI();
+  String datetime = getFormattedTime();
+
+  // create JSON
+  String now = getFormattedTime();
+  String date = now.substring(0, 10);   // "YYYY-MM-DD"
+  String time = now.substring(11);      // "HH:MM:SS"
+  String payload = "{\"waterLevel\":" + String(waterLevel) +
+                   ",\"date\":\"" + String(date) + "\"" +
+                   ",\"time\":\"" + String(time) + "\"" +
+                   ",\"rssi\":" + String(rssi) + "}";
+
+  // send to MQTT
+  if (client.connected()) {
+    client.publish(mqtt_waterlevel_topic, payload.c_str());
+    Serial.println("Send to MQTT topic: " + String(mqtt_waterlevel_topic));
+    Serial.println("Payload: " + payload);
+  } else {
+    Serial.println("MQTT not connected, trying again...");
+    connectMQTT(); // function to reconnect
   }
 }
 
@@ -147,28 +184,26 @@ void handleMeasurement() {
 
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>ESP32 DHT</title></head><body>";
   if (isnan(temp) || isnan(hum)) {
-    html += "<h2>Błąd odczytu z DHT!</h2>";
-    Serial.println("Błąd odczytu z DHT!");
+    html += "<h2>DHT read error!</h2>";
+    Serial.println("DHT read error!");
   } else {
     String now = getFormattedTime();
     long rssi = WiFi.RSSI();
     
-    html += "<p>Data i czas: " + now + "</p>";
-    html += "<p>Siła sygnału WiFi (RSSI): " + String(rssi) + " dBm</p>";
-    html += "<h2>Odczyty z czujnika DHT</h2>";
-    html += "<p>Temperatura: " + String(temp) + " °C</p>";
-    html += "<p>Wilgotność: " + String(hum) + " %</p>";
+    html += "<p>Date and time: " + now + "</p>";
+    html += "<p>WiFi signal strength (RSSI): " + String(rssi) + " dBm</p>";
+    html += "<h2>DHT Sensor Readings</h2>";
+    html += "<p>Temperature: " + String(temp) + " °C</p>";
+    html += "<p>Humidity: " + String(hum) + " %</p>";
   }
   html += "</body></html>";
 
   server.send(200, "text/html", html);
-  // Serial.println("Wysylanie pomiaru na Adres IP: ");
-  // Serial.println(WiFi.localIP());
 
-  // Publikowanie do MQTT w formacie JSON
+  // Publish to MQTT in JSON format
   String now = getFormattedTime();
   long rssi = WiFi.RSSI();
-  // Rozdziel datę i czas
+  // Split date and time
   String date = now.substring(0, 10);   // "YYYY-MM-DD"
   String time = now.substring(11);      // "HH:MM:SS"
   String payload = "{\"temperature\":" + String(temp) +
@@ -184,7 +219,7 @@ void handleMeasurement() {
 void setupHttpServer() {
   server.on("/", handleMeasurement);
   server.begin();
-  Serial.println("Serwer HTTP uruchomiony");
+  Serial.println("HTTP server started");
 }
 
 void initUartToSlave() {  
@@ -194,7 +229,6 @@ void initUartToSlave() {
 }
 
 void readMS5803FromESP8266(const String &cmd) {
-  // wysyłamy komendę
   digitalWrite(RE_DE_PIN, HIGH);
   delayMicroseconds(50);
   uartToSlaveESP.println(cmd);
@@ -204,34 +238,52 @@ void readMS5803FromESP8266(const String &cmd) {
   Serial.println("[ESP32] Send command: " + cmd);
 
   // wait for response
-  delay(100);  
+  delay(100); // ms
 
   if(!uartToSlaveESP.available()) {
     Serial.println("[ESP8266] No response.");
     return;
   }
 
-  // odczytujemy wszystkie linie, które przyszły
+  // read all available lines
   while (uartToSlaveESP.available()) {
     String line = uartToSlaveESP.readStringUntil('\n');
     line.trim();
     if (line.length() > 0) {
       Serial.println("[ESP8266] " + line);
     }
+    if (line.startsWith("TEMP=") && line.indexOf("PRESS=") != -1) {
+      int tempStart = line.indexOf("TEMP=") + 5;
+      int tempEnd = line.indexOf(",", tempStart);
+      int pressStart = line.indexOf("PRESS=") + 6;
+
+      String tempStr = line.substring(tempStart, tempEnd);
+      String pressStr = line.substring(pressStart);
+
+      float tempValue = tempStr.toFloat();
+      float pressValue = pressStr.toFloat();
+
+      Serial.print("Extracted TEMP: ");
+      Serial.print(tempValue);
+      Serial.print(", PRESS: ");
+      Serial.println(pressValue);
+
+      mqttPublishWaterLevel(pressValue);
+    }
   }
 }
 
 void setup() {
   Serial.println("Initializing...");
-  espClient.setInsecure(); // wyłącza weryfikację certyfikatu
+  espClient.setInsecure(); // disables certificate verification
 
   Serial.begin(115200);
   initUartToSlave();
   initTime();
   // dht.begin();
 
-  // connectToWiFi();
-  // connectMQTT();
+  connectToWiFi();
+  connectMQTT();
   // setupHttpServer();
 }
 
@@ -248,7 +300,7 @@ void loop() {
 
   // unsigned long now = millis();
   // // Serial.println("Timestamp: " + String(now) + " diff: " + String(now - lastMsg));
-  // if (now - lastMsg > 10000) {  // co 5 sekund
+  // if (now - lastMsg > 10000) {  // every 5 seconds
   //   lastMsg = now;
   //   mqttPublishSensorData();
   // }
