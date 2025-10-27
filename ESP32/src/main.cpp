@@ -73,53 +73,55 @@ String getFormattedTime() {
   return String(buffer);
 }
 
+// Logging wrapper: print to Serial and optionally forward to MQTT (master logs)
+// Adds an optional severity prefix at the beginning of the log string: [SEVERITY]
+void logInfo(const String &msg, const String &severity = "INFO") {
+  String formatted = String("[") + severity + "] " + msg;
+  Serial.println(formatted);
+  if (mqttClient.connected() && mqtt_enable_master_logs) {
+    String now = getFormattedTime();
+    String payload = String("{") + now + " | " + formatted + "\"}";
+    mqttClient.publish(mqtt_logs_topic, payload.c_str());
+  }
+}
+
 void scanWifi() {
   int n = WiFi.scanNetworks();
-  Serial.println("Available WiFi networks:");
+  logInfo("Available WiFi networks:");
   for (int i = 0; i < n; ++i) {
-    Serial.print(i + 1);
-    Serial.print(": ");
-    Serial.print(WiFi.SSID(i));
-    Serial.print(" (RSSI: ");
-    Serial.print(WiFi.RSSI(i));
-    Serial.print(" dBm) ");
-    Serial.print((WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "Open" : "Secured");
-    Serial.println();
+    String line = String(i + 1) + ": " + String(WiFi.SSID(i)) + " (RSSI: " + String(WiFi.RSSI(i)) + " dBm) " + ((WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "Open" : "Secured");
+    logInfo(line);
   }
   if (n == 0) {
-    Serial.println("No available WiFi networks");
+    logInfo("No available WiFi networks");
   }
-  Serial.println();
+  logInfo("");
 }
 
 void connectToWiFi() {
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(ssid);
   // WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS);
   WiFi.begin(ssid, password);
 
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
-    Serial.print(".");
+    // periodically scan for networks but avoid noisy dot printing
     scanWifi();
   }
 
-  Serial.println("");
-  Serial.println("Connected to WiFi");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
+  logInfo(String("Connected to WiFi: ") + String(ssid));
+  logInfo(String("IP Address: ") + WiFi.localIP().toString());
 }
 
 // --- MQTT Connection ---
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  Serial.println("[MQTT] Callback invoked");
-  Serial.printf("Message arrived [%s]: ", topic);
+  logInfo("[MQTT] Callback invoked");
+  logInfo(String("Message arrived [") + String(topic) + "]: ");
   String message;
   for (unsigned int i = 0; i < length; i++) {
     message += (char)payload[i];
   }
-  Serial.println(message);
+  logInfo(message);
 
   // --- Process the config string here ---
   if (String(topic) == mqtt_esp32_config_topic) {
@@ -128,44 +130,36 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     msg.toUpperCase();
 
     if (msg.startsWith("{")) {
-      Serial.println("Parsing JSON config...");
       // TODO: parse JSON configuration if needed
     } else if (msg.startsWith("DEBUG=")) {
       String val = msg.substring(msg.indexOf('=') + 1);
       val.trim();
       if (val == "1") {
         mqtt_enable_master_logs = true;
-        Serial.println("Config: DEBUG=1 -> enabling log forwarding to MQTT");
+        logInfo("Config: DEBUG=1 -> enabling log forwarding to MQTT");
       } else if (val == "0") {
         mqtt_enable_master_logs = false;
-        Serial.println("Config: DEBUG=0 -> disabling log forwarding to MQTT");
+        logInfo("Config: DEBUG=0 -> disabling log forwarding to MQTT");
       } else {
-        Serial.printf("Unknown DEBUG value: %s\n", val.c_str());
+        logInfo(String("Unknown DEBUG value: ") + val);
       }
 
       // Acknowledge the change back to logs topic (always send ack regardless of forward_logs state)
       String ack = String("{\"DEBUG\":") + val + "}";
       if (mqttClient.connected()) {
         mqttClient.publish(mqtt_logs_topic, ack.c_str());
-        Serial.println("Published DEBUG ack to MQTT: " + ack);
+        logInfo("Published DEBUG ack to MQTT: " + ack);
       } else {
-        Serial.println("Cannot publish DEBUG ack, MQTT not connected");
+        logInfo("Cannot publish DEBUG ack, MQTT not connected");
       }
-    } else if (msg == "RESET") {
-      Serial.println("Config: RESET received -> rebooting ESP32...");
-      // acknowledge reset request
-      String ack = "{\"RESET\":\"OK\"}";
-      if (mqttClient.connected()) {
-        mqttClient.publish(mqtt_logs_topic, ack.c_str());
-        Serial.println("Published RESET ack to MQTT: " + ack);
-      } else {
-        Serial.println("Cannot publish RESET ack, MQTT not connected");
-      }
+    } 
+    else if (msg == "RESET") {
+      logInfo("Config: RESET received -> rebooting ESP32...");
       delay(200);
       ESP.restart();
       delay(1000);
     } else {
-      Serial.printf("Received config: %s\n", message.c_str());
+  logInfo(String("Received config: ") + message);
       // For example, save to variable or preferences
     }
   }
@@ -180,14 +174,13 @@ void mqttConnect() {
 
 void mqttReconnect() {
   while (!mqttClient.connected()) {
-    Serial.print("Connecting to MQTT...");
+    logInfo("Connecting to MQTT...");
     if (mqttClient.connect("ESP32Client", mqtt_user, mqtt_password)) {
-      Serial.println("connected");
+      logInfo("connected");
       // ensure subscription is attempted after a successful connect
       mqttSubscribeConfig();
     } else {
-      Serial.print("failed, rc=");
-      Serial.println(mqttClient.state());
+      logInfo(String("failed, rc=") + String(mqttClient.state()));
       delay(2000);
     }
   }
@@ -205,9 +198,7 @@ float calculateWaterLevel(float pressure_hpa_slave, float pressure_hpa_master) {
 
   float water_level_m = (pressure_hpa_slave - pressure_hpa_master + offset) * 100 / (rho * g); // convert pressure to pa
 
-  Serial.print("Calculated Water Level: ");
-  Serial.print(water_level_m);
-  Serial.println(" m");
+  logInfo(String("Calculated Water Level: ") + String(water_level_m) + " m");
   return water_level_m;
 }
 
@@ -223,6 +214,7 @@ void publishLogToMQTT(const String &logMessage) {
 
   if (mqttClient.connected()) {
     mqttClient.publish(mqtt_logs_topic, payload.c_str());
+    // keep local-only prints here to avoid double-forwarding via logInfo
     Serial.println("Sent log to MQTT topic: " + String(mqtt_logs_topic));
     Serial.println("Log Payload: " + payload);
   } else {
@@ -255,10 +247,10 @@ void mqttPublishWaterLevelAndSensors(float tempValue_slave, float pressValue_sla
   // send to MQTT
   if (mqttClient.connected()) {
     mqttClient.publish(mqtt_waterlevel_topic, payload.c_str());
-    Serial.println("Send to MQTT topic: " + String(mqtt_waterlevel_topic));
-    Serial.println("Payload: " + payload);
+    logInfo("Send to MQTT topic: " + String(mqtt_waterlevel_topic));
+    logInfo("Payload: " + payload);
   } else {
-    Serial.println("MQTT not connected, trying again...");
+    logInfo("MQTT not connected, trying again...");
     mqttConnect(); // function to reconnect
   }
 }
@@ -268,7 +260,7 @@ void printPendingSlaveMessages() {
     String line = uartToSlaveESP.readStringUntil('\n');
     line.trim();
     if (line.length() > 0) {
-      Serial.println("[ESP8266][PRE] " + line);
+        Serial.println("[ESP8266][PRE] " + line);
       publishLogToMQTT("[ESP8266] " + line);
     }
   }
@@ -297,22 +289,18 @@ std::tuple<float, float, float> readMasterSensors() {
       humidity = humEvent.relative_humidity;
     }
   } else {
-    Serial.println("AHT20 not initialized!");
+    logInfo("AHT20 not initialized!");
   }
 
   // --- Read BMP280 (pressure) ---
   if (bmp_ok) {
     pressure_hpa = bmp280.readPressure() / 100.0; // convert Pa to hPa
   } else {
-    Serial.println("BMP280 not initialized!");
+    logInfo("BMP280 not initialized!");
   }
 
-  Serial.print("[ESP32] TEMP=");
-  Serial.print(temperature);
-  Serial.print(", PRESS=");
-  Serial.print(pressure_hpa);
-  Serial.print(", HUMIDITY=");
-  Serial.print(humidity);
+  String line = String("[ESP32] TEMP=") + String(temperature) + ", PRESS=" + String(pressure_hpa) + ", HUMIDITY=" + String(humidity);
+  logInfo(line);
 
   return std::make_tuple(temperature, humidity, pressure_hpa);
 }
@@ -324,7 +312,7 @@ void writeSlaveCommand(const String &cmd) {
   uartToSlaveESP.flush();
   delayMicroseconds(100);
   digitalWrite(RE_DE_PIN, LOW);
-  Serial.println("[ESP32] Send command: " + cmd);
+  logInfo("[ESP32] Send command: " + cmd);
 
   if(cmd == "RESET")
   {
@@ -341,7 +329,7 @@ void readSlaveSensors() {
   delay(100); // ms
 
   if(!uartToSlaveESP.available()) {
-    Serial.println("[ESP8266] No response.");
+    logInfo("[ESP8266] No response.");
     writeSlaveCommand("RESET");
     return;
   }
@@ -351,7 +339,7 @@ void readSlaveSensors() {
     String line = uartToSlaveESP.readStringUntil('\n');
     line.trim();
     if (line.length() > 0) {
-      Serial.println("[ESP8266] " + line);
+      logInfo("[ESP8266] " + line);
     }
     if (line.startsWith("TEMP=") && line.indexOf("PRESS=") != -1) {
       int tempStart = line.indexOf("TEMP=") + 5;
@@ -378,18 +366,18 @@ void initBmp280Aht20() {
   Wire.begin(BMP280_PIN_SDA, BMP280_PIN_SCL);
 
   if (!bmp280.begin()) {
-    Serial.println("Could not find a valid BMP280 sensor, check wiring!");
+    logInfo("Could not find a valid BMP280 sensor, check wiring!");
     bmp_ok = false;
   } else {
-    Serial.println("BMP280 sensor initialized.");
+    logInfo("BMP280 sensor initialized.");
     bmp_ok = true;
   }
 
   if (!aht20.begin()) {
-    Serial.println("Could not find a valid AHT20 sensor, check wiring!");
+    logInfo("Could not find a valid AHT20 sensor, check wiring!");
     aht_ok = false;
   } else {
-    Serial.println("AHT20 sensor initialized.");
+    logInfo("AHT20 sensor initialized.");
     aht_ok = true;
   }
 }
@@ -397,16 +385,16 @@ void initBmp280Aht20() {
 // Subscribe helper: attempts to subscribe to config topic and sets mqtt_subscribed
 void mqttSubscribeConfig() {
   if (mqttClient.subscribe(mqtt_esp32_config_topic)) {
-    Serial.printf("Subscribed to topic: %s\n", mqtt_esp32_config_topic);
+    logInfo(String("Subscribed to topic: ") + String(mqtt_esp32_config_topic));
     mqtt_subscribed = true;
   } else {
-    Serial.printf("Failed to subscribe to topic: %s\n", mqtt_esp32_config_topic);
+    logInfo(String("Failed to subscribe to topic: ") + String(mqtt_esp32_config_topic));
     mqtt_subscribed = false;
   }
 }
 
 void setup() {
-  Serial.println("Initializing...");
+  logInfo("Initializing...");
   espClient.setInsecure(); // disables certificate verification
 
   Serial.begin(115200);
