@@ -1,4 +1,3 @@
-#include <DHT.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WebServer.h>
@@ -10,6 +9,9 @@
 #include <Adafruit_BMP280.h>
 #include <Adafruit_AHTX0.h>
 #include <tuple>
+
+unsigned long lastLoop = 0;
+const unsigned long mainLoopInterval = 5000; // 5 seconds
 
 // ======================= UART (HardwareSerial) =====================
 #define RX_PIN 18 // RO
@@ -27,11 +29,6 @@ Adafruit_AHTX0 aht20;
 bool bmp_ok = false;
 bool aht_ok = false;
 
-// --- DHT ---
-#define DHTPIN 32
-#define DHTTYPE DHT22
-DHT dht(DHTPIN, DHTTYPE);
-
 // --- WiFi ---
 const char* ssid = "4M";
 const char* password = "Shxt-313";
@@ -41,14 +38,22 @@ const char* password = "Shxt-313";
 // --- MQTT (HiveMQ) ---
 const char* mqtt_server = "e492dd1e26cf46eb8faf8bf4c19894e2.s1.eu.hivemq.cloud"; // public HiveMQ broker
 const int mqtt_port = 8883;
-const char* mqtt_topic = "esp32/dht22";
 const char* mqtt_waterlevel_topic = "esp32/studnia";
 const char* mqtt_logs_topic = "esp32/studnia/logs";
+const char* mqtt_esp32_config_topic = "esp32/studnia/config";  // where broker sends config
 const char* mqtt_user = "esp_user";
 const char* mqtt_password = "Rde11#aqaa";
+bool mqtt_subscribed = false;
+// forward logs to MQTT when true
+bool mqtt_enable_master_logs = false;
+bool mqtt_enable_slave_logs = true;
 
-// --- HTTP server ---
-WebServer server(80);
+// ===== MQTT Function prototypes =====
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void mqttConnect();
+void mqttReconnect();
+void mqttSubscribeConfig();
+void mqttPublishWaterLevelAndSensors(float tempValue_slave, float pressValue_slave, float tempValue_master, float humidityValue_master, float pressValue_master);
 
 // --- NTP Functions ---
 void initTime() {
@@ -106,51 +111,85 @@ void connectToWiFi() {
 }
 
 // --- MQTT Connection ---
-void connectMQTT() {
-  mqttClient.setServer(mqtt_server, mqtt_port);
-  while (!mqttClient.connected()) {
-    Serial.print("Connecting to MQTT...");
-    if (mqttClient.connect("ESP32Client", mqtt_user, mqtt_password)) {
-      Serial.println("connected!");
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  Serial.println("[MQTT] Callback invoked");
+  Serial.printf("Message arrived [%s]: ", topic);
+  String message;
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  Serial.println(message);
+
+  // --- Process the config string here ---
+  if (String(topic) == mqtt_esp32_config_topic) {
+    String msg = message;
+    msg.trim();
+    msg.toUpperCase();
+
+    if (msg.startsWith("{")) {
+      Serial.println("Parsing JSON config...");
+      // TODO: parse JSON configuration if needed
+    } else if (msg.startsWith("DEBUG=")) {
+      String val = msg.substring(msg.indexOf('=') + 1);
+      val.trim();
+      if (val == "1") {
+        mqtt_enable_master_logs = true;
+        Serial.println("Config: DEBUG=1 -> enabling log forwarding to MQTT");
+      } else if (val == "0") {
+        mqtt_enable_master_logs = false;
+        Serial.println("Config: DEBUG=0 -> disabling log forwarding to MQTT");
+      } else {
+        Serial.printf("Unknown DEBUG value: %s\n", val.c_str());
+      }
+
+      // Acknowledge the change back to logs topic (always send ack regardless of forward_logs state)
+      String ack = String("{\"DEBUG\":") + val + "}";
+      if (mqttClient.connected()) {
+        mqttClient.publish(mqtt_logs_topic, ack.c_str());
+        Serial.println("Published DEBUG ack to MQTT: " + ack);
+      } else {
+        Serial.println("Cannot publish DEBUG ack, MQTT not connected");
+      }
+    } else if (msg == "RESET") {
+      Serial.println("Config: RESET received -> rebooting ESP32...");
+      // acknowledge reset request
+      String ack = "{\"RESET\":\"OK\"}";
+      if (mqttClient.connected()) {
+        mqttClient.publish(mqtt_logs_topic, ack.c_str());
+        Serial.println("Published RESET ack to MQTT: " + ack);
+      } else {
+        Serial.println("Cannot publish RESET ack, MQTT not connected");
+      }
+      delay(200);
+      ESP.restart();
+      delay(1000);
     } else {
-      Serial.print("error, rc=");
-      Serial.print(mqttClient.state());
-      Serial.println(", trying again in 2s");
-      delay(2000);
+      Serial.printf("Received config: %s\n", message.c_str());
+      // For example, save to variable or preferences
     }
   }
 }
 
-void mqttPublishSensorData() {
-  float temp = dht.readTemperature();
-  float hum = dht.readHumidity();
+void mqttConnect() {
+  // Configure client and hand off connection logic to mqttReconnect()
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
+  mqttReconnect();
+}
 
-  if (isnan(temp) || isnan(hum)) {
-    Serial.println("DHT read error!");
-    return;
-  }
-
-  long rssi = WiFi.RSSI();
-  String datetime = getFormattedTime();
-
-  // Create JSON
-  String now = getFormattedTime();
-  String date = now.substring(0, 10);   // "YYYY-MM-DD"
-  String time = now.substring(11);      // "HH:MM:SS"
-  String payload = "{\"temperature\":" + String(temp) +
-                   ",\"humidity\":" + String(hum) +
-                   ",\"date\":\"" + String(date) + "\"" +
-                   ",\"time\":\"" + String(time) + "\"" +
-                   ",\"rssi\":" + String(rssi) + "}";
-
-  // Send to MQTT
-  if (mqttClient.connected()) {
-    mqttClient.publish(mqtt_topic, payload.c_str());
-    Serial.println("Send to MQTT topic: " + String(mqtt_topic));
-    Serial.println("Payload: " + payload);
-  } else {
-    Serial.println("MQTT not connected, trying again...");
-    connectMQTT(); // function to reconnect
+void mqttReconnect() {
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting to MQTT...");
+    if (mqttClient.connect("ESP32Client", mqtt_user, mqtt_password)) {
+      Serial.println("connected");
+      // ensure subscription is attempted after a successful connect
+      mqttSubscribeConfig();
+    } else {
+      Serial.print("failed, rc=");
+      Serial.println(mqttClient.state());
+      delay(2000);
+    }
   }
 }
 
@@ -173,6 +212,11 @@ float calculateWaterLevel(float pressure_hpa_slave, float pressure_hpa_master) {
 }
 
 void publishLogToMQTT(const String &logMessage) {
+  if (!mqtt_enable_slave_logs) {
+    // Skip forwarding logs 
+    return;
+  }
+
   String now = getFormattedTime();
   String fullMessage = now + " | " + logMessage;
   String payload = "{\"log\":\"" + fullMessage + "\"}";
@@ -183,7 +227,7 @@ void publishLogToMQTT(const String &logMessage) {
     Serial.println("Log Payload: " + payload);
   } else {
     Serial.println("MQTT not connected, trying again...");
-    connectMQTT(); // function to reconnect
+    mqttConnect(); // function to reconnect
   }
 }
 
@@ -215,7 +259,7 @@ void mqttPublishWaterLevelAndSensors(float tempValue_slave, float pressValue_sla
     Serial.println("Payload: " + payload);
   } else {
     Serial.println("MQTT not connected, trying again...");
-    connectMQTT(); // function to reconnect
+    mqttConnect(); // function to reconnect
   }
 }
 
@@ -228,50 +272,6 @@ void printPendingSlaveMessages() {
       publishLogToMQTT("[ESP8266] " + line);
     }
   }
-}
-
-void handleMeasurement() {
-  float temp = dht.readTemperature();
-  float hum = dht.readHumidity();
-
-  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>ESP32 DHT</title></head><body>";
-  if (isnan(temp) || isnan(hum)) {
-    html += "<h2>DHT read error!</h2>";
-    Serial.println("DHT read error!");
-  } else {
-    String now = getFormattedTime();
-    long rssi = WiFi.RSSI();
-    
-    html += "<p>Date and time: " + now + "</p>";
-    html += "<p>WiFi signal strength (RSSI): " + String(rssi) + " dBm</p>";
-    html += "<h2>DHT Sensor Readings</h2>";
-    html += "<p>Temperature: " + String(temp) + " °C</p>";
-    html += "<p>Humidity: " + String(hum) + " %</p>";
-  }
-  html += "</body></html>";
-
-  server.send(200, "text/html", html);
-
-  // Publish to MQTT in JSON format
-  String now = getFormattedTime();
-  long rssi = WiFi.RSSI();
-  // Split date and time
-  String date = now.substring(0, 10);   // "YYYY-MM-DD"
-  String time = now.substring(11);      // "HH:MM:SS"
-  String payload = "{\"temperature\":" + String(temp) +
-                   ",\"humidity\":" + String(hum) +
-                   ",\"date\":\"" + String(date) + "\"" +
-                   ",\"time\":\"" + String(time) + "\"" +
-                   ",\"rssi\":" + String(rssi) + "}";
-  Serial.println("Send to MQTT topic: " + String(mqtt_topic));
-  Serial.println("Payload: " + String(payload));
-  mqttClient.publish(mqtt_topic, payload.c_str());
-}
-
-void setupHttpServer() {
-  server.on("/", handleMeasurement);
-  server.begin();
-  Serial.println("HTTP server started");
 }
 
 void initUartToSlave() {  
@@ -307,18 +307,12 @@ std::tuple<float, float, float> readMasterSensors() {
     Serial.println("BMP280 not initialized!");
   }
 
-  // --- Print nicely ---
-  // Serial.print("Temperature: ");
-  // Serial.print(temperature, 2);
-  // Serial.println(" °C");
-
-  // Serial.print("Humidity: ");
-  // Serial.print(humidity, 2);
-  // Serial.println(" %");
-
-  // Serial.print("Pressure: ");
-  // Serial.print(pressure_hpa, 2);
-  // Serial.println(" hPa\n");
+  Serial.print("[ESP32] TEMP=");
+  Serial.print(temperature);
+  Serial.print(", PRESS=");
+  Serial.print(pressure_hpa);
+  Serial.print(", HUMIDITY=");
+  Serial.print(humidity);
 
   return std::make_tuple(temperature, humidity, pressure_hpa);
 }
@@ -331,6 +325,12 @@ void writeSlaveCommand(const String &cmd) {
   delayMicroseconds(100);
   digitalWrite(RE_DE_PIN, LOW);
   Serial.println("[ESP32] Send command: " + cmd);
+
+  if(cmd == "RESET")
+  {
+      // wait for slave to reboot
+      delay(30000);
+  }
 }
 
 void readSlaveSensors() {
@@ -343,7 +343,6 @@ void readSlaveSensors() {
   if(!uartToSlaveESP.available()) {
     Serial.println("[ESP8266] No response.");
     writeSlaveCommand("RESET");
-    delay(5000);
     return;
   }
 
@@ -365,18 +364,12 @@ void readSlaveSensors() {
       float tempValue_slave = tempStr.toFloat();
       float pressValue_slave = pressStr.toFloat();
 
-      // Serial.print("Extracted TEMP: ");
-      // Serial.print(tempValue_slave);
-      // Serial.print(", PRESS: ");
-      // Serial.println(pressValue_slave);
-
       auto [tempValue_master, humidityValue_master, pressValue_master] = readMasterSensors();
 
       mqttPublishWaterLevelAndSensors(tempValue_slave, pressValue_slave, tempValue_master, humidityValue_master, pressValue_master);
     }
     else if (line.indexOf("ERR") != -1) {
       writeSlaveCommand("RESET");
-      delay(5000);
     }
   }
 }
@@ -401,6 +394,17 @@ void initBmp280Aht20() {
   }
 }
 
+// Subscribe helper: attempts to subscribe to config topic and sets mqtt_subscribed
+void mqttSubscribeConfig() {
+  if (mqttClient.subscribe(mqtt_esp32_config_topic)) {
+    Serial.printf("Subscribed to topic: %s\n", mqtt_esp32_config_topic);
+    mqtt_subscribed = true;
+  } else {
+    Serial.printf("Failed to subscribe to topic: %s\n", mqtt_esp32_config_topic);
+    mqtt_subscribed = false;
+  }
+}
+
 void setup() {
   Serial.println("Initializing...");
   espClient.setInsecure(); // disables certificate verification
@@ -408,37 +412,25 @@ void setup() {
   Serial.begin(115200);
   initUartToSlave();
   initTime();
-  // dht.begin();
 
   initBmp280Aht20();
 
   connectToWiFi();
-  connectMQTT();
-  // setupHttpServer();
+  mqttConnect();
 }
-
-unsigned long lastMsg = 0; // Move outside loop to retain value between iterations
 
 void loop() {
 
-  readSlaveSensors();
+  if (!mqttClient.connected()) {
+    mqttReconnect();
+  }
+  mqttClient.loop();
 
-  // std::pair<float,float> result = std::make_pair(NAN, NAN);
-  // if (bmp_ok && aht_ok) {
-  //   auto [temp, hum, press] = readMasterSensors();
-  //     Serial.print("Temp=");
-  //     Serial.print(temp);
-  //     Serial.print("°C, Hum=");
-  //     Serial.print(hum);
-  //     Serial.print("%, Press=");
-  //     Serial.print(press);
-  //     Serial.println(" hPa");
-  // }
+  unsigned long now = millis();
+  if (now - lastLoop >= mainLoopInterval) {
+    lastLoop = now;
 
-  // if (!isnan(result.first)) {
-  //   tempValue = result.first;
-  //   pressValue = result.second / 100.0; // convert Pa to mbar
-  // }
-
-  delay(5000); // main loop delay
+    // readSlaveSensors();
+    // publish data etc.
+  }
 }
