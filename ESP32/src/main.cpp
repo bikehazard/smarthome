@@ -30,10 +30,10 @@ bool bmp_ok = false;
 bool aht_ok = false;
 
 // --- WiFi ---
-const char* ssid = "4M";
-const char* password = "Shxt-313";
-// const char* ssid = "Mnet_0";
-// const char* password = "Vgt15rst";
+// const char* ssid = "4M";
+// const char* password = "Shxt-313";
+const char* ssid = "Mnet_0";
+const char* password = "Vgt15rst";
 
 // --- MQTT (HiveMQ) ---
 const char* mqtt_server = "e492dd1e26cf46eb8faf8bf4c19894e2.s1.eu.hivemq.cloud"; // public HiveMQ broker
@@ -46,7 +46,7 @@ const char* mqtt_password = "Rde11#aqaa";
 bool mqtt_subscribed = false;
 // forward logs to MQTT when true
 bool mqtt_enable_master_logs = false;
-bool mqtt_enable_slave_logs = true;
+bool mqtt_enable_slave_logs = false;
 
 // ===== MQTT Function prototypes =====
 void mqttCallback(char* topic, byte* payload, unsigned int length);
@@ -75,27 +75,27 @@ String getFormattedTime() {
 
 // Logging wrapper: print to Serial and optionally forward to MQTT (master logs)
 // Adds an optional severity prefix at the beginning of the log string: [SEVERITY]
-void logInfo(const String &msg, const String &severity = "INFO") {
+void logger(const String &msg, const String &severity = "INFO") {
   String formatted = String("[") + severity + "] " + msg;
   Serial.println(formatted);
   if (mqttClient.connected() && mqtt_enable_master_logs) {
     String now = getFormattedTime();
-    String payload = String("{") + now + " | " + formatted + "\"}";
+    // Build JSON payload with time and log fields
+    String payload = String("{\"time\":\"") + now + String("\",\"log\":\"") + formatted + String("\"}");
     mqttClient.publish(mqtt_logs_topic, payload.c_str());
   }
 }
 
 void scanWifi() {
   int n = WiFi.scanNetworks();
-  logInfo("Available WiFi networks:");
+  logger("Available WiFi networks:");
   for (int i = 0; i < n; ++i) {
     String line = String(i + 1) + ": " + String(WiFi.SSID(i)) + " (RSSI: " + String(WiFi.RSSI(i)) + " dBm) " + ((WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "Open" : "Secured");
-    logInfo(line);
+    logger(line);
   }
   if (n == 0) {
-    logInfo("No available WiFi networks");
+    logger("No available WiFi networks");
   }
-  logInfo("");
 }
 
 void connectToWiFi() {
@@ -103,28 +103,26 @@ void connectToWiFi() {
   WiFi.begin(ssid, password);
 
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    delay(1000);
     // periodically scan for networks but avoid noisy dot printing
     scanWifi();
   }
 
-  logInfo(String("Connected to WiFi: ") + String(ssid));
-  logInfo(String("IP Address: ") + WiFi.localIP().toString());
+  logger(String("Connected to WiFi: ") + String(ssid));
+  logger(String("IP Address: ") + WiFi.localIP().toString());
 }
 
 // --- MQTT Connection ---
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  logInfo("[MQTT] Callback invoked");
-  logInfo(String("Message arrived [") + String(topic) + "]: ");
-  String message;
-  for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
-  logInfo(message);
+
+  // topic is a null-terminated string; payload may NOT be null-terminated.
+  // Safely construct a String from the payload using the provided length.
+  String message = String((const char*)payload, length);
+  logger("[MQTT] Callback invoked. Topic: " + String(topic) + " ,message: " + String(message));
 
   // --- Process the config string here ---
-  if (String(topic) == mqtt_esp32_config_topic) {
+  // if (String(topic) == mqtt_esp32_config_topic) {
     String msg = message;
     msg.trim();
     msg.toUpperCase();
@@ -136,33 +134,38 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       val.trim();
       if (val == "1") {
         mqtt_enable_master_logs = true;
-        logInfo("Config: DEBUG=1 -> enabling log forwarding to MQTT");
+        mqtt_enable_slave_logs = true;
+        logger("Config: DEBUG=1 -> enabling log forwarding to MQTT");
       } else if (val == "0") {
         mqtt_enable_master_logs = false;
-        logInfo("Config: DEBUG=0 -> disabling log forwarding to MQTT");
+        mqtt_enable_slave_logs = false;
+        logger("Config: DEBUG=0 -> disabling log forwarding to MQTT");
       } else {
-        logInfo(String("Unknown DEBUG value: ") + val);
+        logger(String("Unknown DEBUG value: ") + val, "WARN");
       }
 
       // Acknowledge the change back to logs topic (always send ack regardless of forward_logs state)
-      String ack = String("{\"DEBUG\":") + val + "}";
-      if (mqttClient.connected()) {
-        mqttClient.publish(mqtt_logs_topic, ack.c_str());
-        logInfo("Published DEBUG ack to MQTT: " + ack);
-      } else {
-        logInfo("Cannot publish DEBUG ack, MQTT not connected");
-      }
+      // String ack = String("{\"DEBUG\":") + val + "}";
+      // if (mqttClient.connected()) {
+      //   mqttClient.publish(mqtt_logs_topic, ack.c_str());
+      //   logger("Published DEBUG ack to MQTT: " + ack);
+      // } else {
+      //   logger("Cannot publish DEBUG ack, MQTT not connected", "WARN");
+      // }
     } 
     else if (msg == "RESET") {
-      logInfo("Config: RESET received -> rebooting ESP32...");
-      delay(200);
+      logger("Config: RESET received -> rebooting ESP32...", "WARN");
+      delay(2000);
       ESP.restart();
-      delay(1000);
+      delay(2000);
     } else {
-  logInfo(String("Received config: ") + message);
+      logger(String("Received unknown config: ") + message);
       // For example, save to variable or preferences
     }
-  }
+  // }
+  // else {
+  //   logger(String("Unknown topic: ") + String(topic) + " ,message: " + String(message), "WARN");
+  // }
 }
 
 void mqttConnect() {
@@ -174,13 +177,13 @@ void mqttConnect() {
 
 void mqttReconnect() {
   while (!mqttClient.connected()) {
-    logInfo("Connecting to MQTT...");
+    logger("Connecting to MQTT...");
     if (mqttClient.connect("ESP32Client", mqtt_user, mqtt_password)) {
-      logInfo("connected");
+      logger("connected");
       // ensure subscription is attempted after a successful connect
       mqttSubscribeConfig();
     } else {
-      logInfo(String("failed, rc=") + String(mqttClient.state()));
+      logger(String("failed, rc=") + String(mqttClient.state()), "WARN");
       delay(2000);
     }
   }
@@ -198,7 +201,7 @@ float calculateWaterLevel(float pressure_hpa_slave, float pressure_hpa_master) {
 
   float water_level_m = (pressure_hpa_slave - pressure_hpa_master + offset) * 100 / (rho * g); // convert pressure to pa
 
-  logInfo(String("Calculated Water Level: ") + String(water_level_m) + " m");
+  // logger(String("Calculated Water Level: ") + String(water_level_m) + " m");
   return water_level_m;
 }
 
@@ -214,7 +217,7 @@ void publishLogToMQTT(const String &logMessage) {
 
   if (mqttClient.connected()) {
     mqttClient.publish(mqtt_logs_topic, payload.c_str());
-    // keep local-only prints here to avoid double-forwarding via logInfo
+    // keep local-only prints here to avoid double-forwarding via logger
     Serial.println("Sent log to MQTT topic: " + String(mqtt_logs_topic));
     Serial.println("Log Payload: " + payload);
   } else {
@@ -247,10 +250,10 @@ void mqttPublishWaterLevelAndSensors(float tempValue_slave, float pressValue_sla
   // send to MQTT
   if (mqttClient.connected()) {
     mqttClient.publish(mqtt_waterlevel_topic, payload.c_str());
-    logInfo("Send to MQTT topic: " + String(mqtt_waterlevel_topic));
-    logInfo("Payload: " + payload);
+    // logger("Send to MQTT topic: " + String(mqtt_waterlevel_topic));
+    logger("MQTT Payload: " + payload);
   } else {
-    logInfo("MQTT not connected, trying again...");
+    logger("MQTT not connected, trying again...");
     mqttConnect(); // function to reconnect
   }
 }
@@ -260,8 +263,8 @@ void printPendingSlaveMessages() {
     String line = uartToSlaveESP.readStringUntil('\n');
     line.trim();
     if (line.length() > 0) {
-        Serial.println("[ESP8266][PRE] " + line);
-      publishLogToMQTT("[ESP8266] " + line);
+        Serial.println("[SLAVE] " + line);
+        publishLogToMQTT("[SLAVE] " + line);
     }
   }
 }
@@ -289,18 +292,18 @@ std::tuple<float, float, float> readMasterSensors() {
       humidity = humEvent.relative_humidity;
     }
   } else {
-    logInfo("AHT20 not initialized!");
+    logger("AHT20 not initialized!", "WARN");
   }
 
   // --- Read BMP280 (pressure) ---
   if (bmp_ok) {
     pressure_hpa = bmp280.readPressure() / 100.0; // convert Pa to hPa
   } else {
-    logInfo("BMP280 not initialized!");
+    logger("BMP280 not initialized!", "WARN");
   }
 
-  String line = String("[ESP32] TEMP=") + String(temperature) + ", PRESS=" + String(pressure_hpa) + ", HUMIDITY=" + String(humidity);
-  logInfo(line);
+  String line = String("[MASTER] TEMP=") + String(temperature) + ", PRESS=" + String(pressure_hpa) + ", HUMIDITY=" + String(humidity);
+  logger(line);
 
   return std::make_tuple(temperature, humidity, pressure_hpa);
 }
@@ -312,7 +315,7 @@ void writeSlaveCommand(const String &cmd) {
   uartToSlaveESP.flush();
   delayMicroseconds(100);
   digitalWrite(RE_DE_PIN, LOW);
-  logInfo("[ESP32] Send command: " + cmd);
+  logger("[MASTER] Send command: " + cmd);
 
   if(cmd == "RESET")
   {
@@ -329,7 +332,7 @@ void readSlaveSensors() {
   delay(100); // ms
 
   if(!uartToSlaveESP.available()) {
-    logInfo("[ESP8266] No response.");
+    logger("[ESP8266] No response.", "WARN");
     writeSlaveCommand("RESET");
     return;
   }
@@ -339,7 +342,7 @@ void readSlaveSensors() {
     String line = uartToSlaveESP.readStringUntil('\n');
     line.trim();
     if (line.length() > 0) {
-      logInfo("[ESP8266] " + line);
+      logger("[SLAVE] " + line);
     }
     if (line.startsWith("TEMP=") && line.indexOf("PRESS=") != -1) {
       int tempStart = line.indexOf("TEMP=") + 5;
@@ -366,18 +369,18 @@ void initBmp280Aht20() {
   Wire.begin(BMP280_PIN_SDA, BMP280_PIN_SCL);
 
   if (!bmp280.begin()) {
-    logInfo("Could not find a valid BMP280 sensor, check wiring!");
+    logger("Could not find a valid BMP280 sensor, check wiring!", "WARN");
     bmp_ok = false;
   } else {
-    logInfo("BMP280 sensor initialized.");
+    logger("BMP280 sensor initialized.");
     bmp_ok = true;
   }
 
   if (!aht20.begin()) {
-    logInfo("Could not find a valid AHT20 sensor, check wiring!");
+    logger("Could not find a valid AHT20 sensor, check wiring!", "WARN");
     aht_ok = false;
   } else {
-    logInfo("AHT20 sensor initialized.");
+    logger("AHT20 sensor initialized.");
     aht_ok = true;
   }
 }
@@ -385,16 +388,16 @@ void initBmp280Aht20() {
 // Subscribe helper: attempts to subscribe to config topic and sets mqtt_subscribed
 void mqttSubscribeConfig() {
   if (mqttClient.subscribe(mqtt_esp32_config_topic)) {
-    logInfo(String("Subscribed to topic: ") + String(mqtt_esp32_config_topic));
+    logger(String("Subscribed to topic: ") + String(mqtt_esp32_config_topic));
     mqtt_subscribed = true;
   } else {
-    logInfo(String("Failed to subscribe to topic: ") + String(mqtt_esp32_config_topic));
+    logger(String("Failed to subscribe to topic: ") + String(mqtt_esp32_config_topic), "WARN");
     mqtt_subscribed = false;
   }
 }
 
 void setup() {
-  logInfo("Initializing...");
+  logger("Initializing...");
   espClient.setInsecure(); // disables certificate verification
 
   Serial.begin(115200);
@@ -418,7 +421,6 @@ void loop() {
   if (now - lastLoop >= mainLoopInterval) {
     lastLoop = now;
 
-    // readSlaveSensors();
-    // publish data etc.
+    readSlaveSensors();
   }
 }
