@@ -9,9 +9,38 @@
 #include <Adafruit_BMP280.h>
 #include <Adafruit_AHTX0.h>
 #include <tuple>
+#include <Preferences.h>
+#include <ArduinoOTA.h>
 
 unsigned long lastLoop = 0;
-const unsigned long mainLoopInterval = 5000; // 5 seconds
+const unsigned long READ_SENSOR_INTERVAL   = 10000; // 10 seconds
+const float SPEED_CALC_INTERVAL            = 10 * 60 * 1000; // 10 minutes
+const float CRITICAL_WATER_LEVEL           = 12.5; // m
+const float MIN_NOTICABLE_LEVEL_CHANGE_M   = 0.05; // m
+const float MIN_NOTICABLE_SPEED_CHANGE_MPM = 0.01; // m/min
+const float WATER_STATS_PUBLISH_INTERVAL   = 10 * 60 * 1000; // 10 minutes
+
+float previousWaterLevel = 0.0;
+int readSlaveSensorCounter = 0;
+float currentWaterSpeedPerHour = 0.0;
+
+float maxRecordedWaterLevel = 0.0;
+float minRecordedWaterLevel = 0.0;
+float maxRecordedWaterIncreaseSpeed = 0.0;
+float maxRecordedWaterDecreaseSpeed = 0.0;
+float waterLevel12hAgo = 0.0;
+float waterLevel1hAgo = 0.0;
+String maxRecordedWaterLevelDate = "N/A";
+String minRecordedWaterLevelDate = "N/A";
+String maxRecordedWaterIncreaseSpeedDate = "N/A";
+String maxRecordedWaterDecreaseSpeedDate = "N/A";  
+
+
+// Preferences for storing stats
+
+Preferences memory;
+void resetMemory();
+void readMemory();
 
 // ======================= UART (HardwareSerial) =====================
 #define RX_PIN 18 // RO
@@ -34,6 +63,7 @@ bool aht_ok = false;
 // const char* password = "Shxt-313";
 const char* ssid = "Mnet_0";
 const char* password = "Vgt15rst";
+const char* host = "esp32-updater-studnia";
 
 // --- MQTT (HiveMQ) ---
 const char* mqtt_server = "e492dd1e26cf46eb8faf8bf4c19894e2.s1.eu.hivemq.cloud"; // public HiveMQ broker
@@ -41,6 +71,7 @@ const int mqtt_port = 8883;
 const char* mqtt_waterlevel_topic = "esp32/studnia";
 const char* mqtt_logs_topic = "esp32/studnia/logs";
 const char* mqtt_esp32_config_topic = "esp32/studnia/config";  // where broker sends config
+const char* mqtt_waterlevel_stats_topic = "esp32/studnia/stats";
 const char* mqtt_user = "esp_user";
 const char* mqtt_password = "Rde11#aqaa";
 bool mqtt_subscribed = false;
@@ -54,6 +85,7 @@ void mqttConnect();
 void mqttReconnect();
 void mqttSubscribeConfig();
 void mqttPublishWaterLevelAndSensors(float tempValue_slave, float pressValue_slave, float tempValue_master, float humidityValue_master, float pressValue_master);
+void mqttPublishWaterLevelStats();
 
 // --- NTP Functions ---
 void initTime() {
@@ -143,22 +175,20 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       } else {
         logger(String("Unknown DEBUG value: ") + val, "WARN");
       }
-
-      // Acknowledge the change back to logs topic (always send ack regardless of forward_logs state)
-      // String ack = String("{\"DEBUG\":") + val + "}";
-      // if (mqttClient.connected()) {
-      //   mqttClient.publish(mqtt_logs_topic, ack.c_str());
-      //   logger("Published DEBUG ack to MQTT: " + ack);
-      // } else {
-      //   logger("Cannot publish DEBUG ack, MQTT not connected", "WARN");
-      // }
     } 
     else if (msg == "RESET") {
       logger("Config: RESET received -> rebooting ESP32...", "WARN");
       delay(2000);
       ESP.restart();
       delay(2000);
-    } else {
+    } else if (msg == "RESETMEMORY")  {
+      resetMemory();
+      delay(100);
+      readMemory();
+      logger("Memory reset command executed.");
+      return;
+    } 
+    else {
       logger(String("Received unknown config: ") + message);
       // For example, save to variable or preferences
     }
@@ -178,7 +208,7 @@ void mqttConnect() {
 void mqttReconnect() {
   while (!mqttClient.connected()) {
     logger("Connecting to MQTT...");
-    if (mqttClient.connect("ESP32Client", mqtt_user, mqtt_password)) {
+    if (mqttClient.connect("ESP32Client_Studnia_Master", mqtt_user, mqtt_password)) {
       logger("connected");
       // ensure subscription is attempted after a successful connect
       mqttSubscribeConfig();
@@ -226,9 +256,110 @@ void publishLogToMQTT(const String &logMessage) {
   }
 }
 
+float absDiff(float a, float b) {
+    return (a > b) ? (a - b) : (b - a);
+}
+
+void updateWaterLevelStats(float currentWaterLevel) {
+
+    String now = getFormattedTime();
+    String currentDate = now.substring(0, 10); // "2025-11-10"
+
+    if (readSlaveSensorCounter >= (SPEED_CALC_INTERVAL / READ_SENSOR_INTERVAL)) {
+        float delta = currentWaterLevel - previousWaterLevel;
+        
+        // FIX: Cast SPEED_CALC_INTERVAL to a float or use a floating-point literal 
+        // in the divisor (3600000.0) to ensure the result is a float (hours).
+        // 3600000.0 ms = 1 hour
+        const float MILLISECONDS_IN_HOUR = 3600000.0f; 
+        
+        float hourElapsed = ((float)SPEED_CALC_INTERVAL / MILLISECONDS_IN_HOUR) * readSlaveSensorCounter; // Multiply by readSlaveSensorCounter 
+                                                // to get the total elapsed time since 
+                                                // the last reading, assuming 
+                                                // readSlaveSensorCounter increases 
+                                                // by 1 every READ_SENSOR_INTERVAL. 
+                                                // If SPEED_CALC_INTERVAL is the total 
+                                                // interval, just use the first line:
+                                                 
+        // Standard (and safer) calculation for the entire interval:
+        float totalTimeElapsedMs = (float)SPEED_CALC_INTERVAL;
+        float hourElapsedCorrect = totalTimeElapsedMs / MILLISECONDS_IN_HOUR; // hours
+        
+        currentWaterSpeedPerHour = (delta / hourElapsedCorrect);  // level change m/hour
+        previousWaterLevel = currentWaterLevel;
+        readSlaveSensorCounter = 0;
+
+        Serial.printf("Water Speed: %.2f m/h\n", currentWaterSpeedPerHour);
+        logger("DEBUG delta: " + String(delta) + " m, hoursElapsed: " + String(hourElapsedCorrect) + " h, currentWaterSpeedPerHour: " + String(currentWaterSpeedPerHour) + " m/h", "DEBUG");
+    }
+
+    if (currentWaterLevel > maxRecordedWaterLevel && absDiff(currentWaterLevel, maxRecordedWaterLevel) >= MIN_NOTICABLE_LEVEL_CHANGE_M) {
+        maxRecordedWaterLevel = currentWaterLevel;
+        maxRecordedWaterLevelDate = currentDate;
+        memory.putFloat("maxWaterLev", maxRecordedWaterLevel);
+        memory.putString("maxWaterLevDate", maxRecordedWaterLevelDate);
+    }
+
+    if (currentWaterLevel < minRecordedWaterLevel && absDiff(currentWaterLevel, minRecordedWaterLevel) >= MIN_NOTICABLE_LEVEL_CHANGE_M) {
+        minRecordedWaterLevel = currentWaterLevel;
+        minRecordedWaterLevelDate = currentDate;
+        memory.putFloat("minWaterLev", minRecordedWaterLevel);
+        memory.putString("minWaterLevDate", minRecordedWaterLevelDate);
+    }
+
+    if (currentWaterSpeedPerHour > maxRecordedWaterIncreaseSpeed && absDiff(currentWaterSpeedPerHour, maxRecordedWaterIncreaseSpeed) >= MIN_NOTICABLE_SPEED_CHANGE_MPM) {
+        maxRecordedWaterIncreaseSpeed = currentWaterSpeedPerHour;
+        maxRecordedWaterIncreaseSpeedDate = currentDate;
+        memory.putFloat("maxWaterPosSpd", maxRecordedWaterIncreaseSpeed);
+        memory.putString("maxWaterPosSpdD", maxRecordedWaterIncreaseSpeedDate);
+    }
+
+    if (currentWaterSpeedPerHour < maxRecordedWaterDecreaseSpeed && absDiff(currentWaterSpeedPerHour, maxRecordedWaterDecreaseSpeed) >= MIN_NOTICABLE_SPEED_CHANGE_MPM) {
+        maxRecordedWaterDecreaseSpeed = currentWaterSpeedPerHour;
+        maxRecordedWaterDecreaseSpeedDate = currentDate;
+        memory.putFloat("minWaterNegSpd", maxRecordedWaterDecreaseSpeed);
+        memory.putString("minWaterNegSpdD", maxRecordedWaterDecreaseSpeedDate);
+    }
+}
+
 void mqttPublishWaterLevelAndSensors(float tempValue_slave, float pressValue_slave, float tempValue_master, float humidityValue_master, float pressValue_master) {
   
   float waterLevel = calculateWaterLevel(pressValue_slave, pressValue_master);
+
+  long rssi = WiFi.RSSI();
+  String datetime = getFormattedTime();
+
+  float percentageLevel = waterLevel / CRITICAL_WATER_LEVEL;
+  updateWaterLevelStats(waterLevel);
+
+  // create JSON
+  String now = getFormattedTime();
+  String date = now.substring(0, 10);   // "YYYY-MM-DD"
+  String time = now.substring(11);      // "HH:MM:SS"
+  String payload = "{\"waterLev\":" + String(waterLevel)  +
+                   ",\"waterLevPerc\":\"" + String(percentageLevel) +
+                   ",\"waterSpeed\":" + String(currentWaterSpeedPerHour) +
+                   ",\"tempSlave\":" + String(tempValue_slave) +
+                   ",\"pressSlave\":" + String(pressValue_slave) +
+                   ",\"tempMaster\":" + String(tempValue_master) +
+                   ",\"humidityMaster\":" + String(humidityValue_master) +
+                   ",\"pressMaster\":" + String(pressValue_master) +
+                   ",\"date\":\"" + String(date) +
+                   ",\"time\":\"" + String(time) +
+                   ",\"rssi\":" + String(rssi) + "}";
+
+  // send to MQTT
+  if (mqttClient.connected()) {
+    mqttClient.publish(mqtt_waterlevel_topic, payload.c_str());
+    // logger("Send to MQTT topic: " + String(mqtt_waterlevel_topic));
+    logger("MQTT Payload: " + payload);
+  } else {
+    logger("MQTT not connected, trying again...");
+    mqttConnect(); // function to reconnect
+  }
+}
+
+void mqttPublishWaterLevelStats() {
 
   long rssi = WiFi.RSSI();
   String datetime = getFormattedTime();
@@ -237,19 +368,20 @@ void mqttPublishWaterLevelAndSensors(float tempValue_slave, float pressValue_sla
   String now = getFormattedTime();
   String date = now.substring(0, 10);   // "YYYY-MM-DD"
   String time = now.substring(11);      // "HH:MM:SS"
-  String payload = "{\"waterLevel\":" + String(waterLevel) + "\"" +
-                   ",\"tempSlave\":" + String(tempValue_slave) + "\"" +
-                   ",\"pressSlave\":" + String(pressValue_slave) + "\"" +
-                   ",\"tempMaster\":" + String(tempValue_master) + "\"" +
-                   ",\"humidityMaster\":" + String(humidityValue_master) + "\"" +
-                   ",\"pressMaster\":" + String(pressValue_master) + "\"" +
-                   ",\"date\":\"" + String(date) + "\"" +
-                   ",\"time\":\"" + String(time) + "\"" +
-                   ",\"rssi\":" + String(rssi) + "}";
+
+  String payload = "{"
+    "\"maxLev\":\"" + String(maxRecordedWaterLevelDate) + " " + String(maxRecordedWaterLevel, 2) + "m\","
+    "\"minLev\":\"" + String(minRecordedWaterLevelDate) + " " + String(minRecordedWaterLevel, 2) + "m\","
+    "\"maxInc\":\"" + String(maxRecordedWaterIncreaseSpeedDate) + " " + String(maxRecordedWaterIncreaseSpeed) + "m/h\","
+    "\"maxDec\":\"" + String(maxRecordedWaterDecreaseSpeedDate) + " " + String(maxRecordedWaterDecreaseSpeed) + "m/h\","
+    "\"date\":\"" + String(date) + "\","
+    "\"time\":\"" + String(time) + "\","
+    "\"rssi\":" + String(rssi) + "\""
+  "}";
 
   // send to MQTT
   if (mqttClient.connected()) {
-    mqttClient.publish(mqtt_waterlevel_topic, payload.c_str());
+    mqttClient.publish(mqtt_waterlevel_stats_topic, payload.c_str());
     // logger("Send to MQTT topic: " + String(mqtt_waterlevel_topic));
     logger("MQTT Payload: " + payload);
   } else {
@@ -325,6 +457,8 @@ void writeSlaveCommand(const String &cmd) {
 }
 
 void readSlaveSensors() {
+  readSlaveSensorCounter++;
+
   printPendingSlaveMessages();
   writeSlaveCommand("ALL");
 
@@ -396,9 +530,68 @@ void mqttSubscribeConfig() {
   }
 }
 
+void readMemory()
+{
+  logger("Reading stored statistics from NVS...");
+
+  maxRecordedWaterLevel = memory.getFloat("maxWaterLev", 0.0);
+  minRecordedWaterLevel = memory.getFloat("minWaterLev", 0.0);
+  maxRecordedWaterLevelDate = memory.getString("maxWaterLevDate", "");
+  minRecordedWaterLevelDate = memory.getString("minWaterLevDate", "");
+
+  maxRecordedWaterIncreaseSpeed = memory.getFloat("maxWaterPosSpd", 0.0);
+  maxRecordedWaterDecreaseSpeed = memory.getFloat("minWaterNegSpd", 0.0);
+  maxRecordedWaterIncreaseSpeedDate = memory.getString("maxWaterPosSpdD", "");
+  maxRecordedWaterDecreaseSpeedDate = memory.getString("minWaterNegSpdD", "");
+}
+
+void resetMemory() {
+  logger("Resetting stored statistics in NVS...");
+  memory.begin("myApp", false);
+  memory.clear();
+  delay(10);
+  memory.putFloat("minWaterLev", 12.0); // start high
+  memory.end();
+  memory.begin("myApp", false);
+
+  memory.putFloat("minWaterLev", 10.0); // start low
+}
+
+// IOTA 
+void initOTA() {
+  ArduinoOTA.setHostname(host);
+
+  ArduinoOTA
+    .onStart([]() {
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH)
+        type = "sketch";
+      else // U_SPIFFS
+        type = "filesystem";
+      Serial.println("Start aktualizacji " + type);
+    })
+    .onEnd([]() {
+      Serial.println("\nKoniec aktualizacji!");
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("Blad[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+      else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    });
+
+  ArduinoOTA.begin();
+  Serial.println("[INFO] OTA ready.");
+}
+
 void setup() {
   logger("Initializing...");
   espClient.setInsecure(); // disables certificate verification
+
+  memory.begin("myApp", false); 
+  readMemory();
 
   Serial.begin(115200);
   initUartToSlave();
@@ -407,10 +600,14 @@ void setup() {
   initBmp280Aht20();
 
   connectToWiFi();
+  initOTA();
+
   mqttConnect();
 }
 
 void loop() {
+
+  ArduinoOTA.handle();
 
   if (!mqttClient.connected()) {
     mqttReconnect();
@@ -418,9 +615,18 @@ void loop() {
   mqttClient.loop();
 
   unsigned long now = millis();
-  if (now - lastLoop >= mainLoopInterval) {
+  if (now - lastLoop >= READ_SENSOR_INTERVAL) {
     lastLoop = now;
-
     readSlaveSensors();
+  }
+
+  // publish water level stats periodically
+  static unsigned long lastPublishMs = 0;
+  unsigned long nowMs = millis();
+  if (lastPublishMs == 0) lastPublishMs = nowMs;
+
+  if (nowMs - lastPublishMs >= (unsigned long)WATER_STATS_PUBLISH_INTERVAL) {
+    mqttPublishWaterLevelStats();
+    lastPublishMs = nowMs;
   }
 }
