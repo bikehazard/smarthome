@@ -8,25 +8,48 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <ArduinoJson.h>
-#include <Preferences.h>
+#include <ArduinoOTA.h>
 
-const float CRITICAL_WATER_LEVEL          = 12.5; // m
-const float RED_WATER_LEVEL_PERCENTAGE    = 90.0; // %
-const float YELLOW_WATER_LEVEL_PERCENTAGE = 70.0; // %
+// thresholds are percentages (0..100)
+const float YELLOW_WATER_LEVEL_PERCENTAGE = 0.02; // %
+const float RED_WATER_LEVEL_PERCENTAGE    = 0.05; // %
+const float HYST = 0.01; // hysteresis margin in percent
+const unsigned long NOTIFY_TIMEOUT_MS = 60ul * 1000ul; // 60 seconds
 
 enum State { GREEN_S, YELLOW_S, RED_S };
-static State lastState = GREEN_S;
+// track last state separately for the two diodes
+static State lastStateStudnia = GREEN_S;
+static State lastStateZbiornik = GREEN_S;
 
-Preferences memory;
+struct lcdDataStruct {
+  String line1;
+  String line2;
+};
+
+lcdDataStruct lcdData;
+
+// --- Diode timeout tracking ---
+static unsigned long lastNotifyStudnia = 0;
+static unsigned long lastNotifyZbiornik = 0;
+static bool studniaTimedOut = false;
+static bool zbiornikTimedOut = false;
 
 // --- WiFi ---
 const char* ssid = "4M";
 const char* password = "Shxt-313";
+const char* host = "esp32-updater-lcd-monitoring";
 
 // --- LED diode ---
-#define PIN_RED   18
-#define PIN_GREEN 19
-#define PIN_BLUE  21
+#define STUDNIA_LED_PIN_RED   18
+#define STUDNIA_LED_PIN_GREEN 19
+#define STUDNIA_LED_PIN_BLUE  21
+
+#define ZBIORNIK_LED_PIN_RED   14
+#define ZBIORNIK_LED_PIN_GREEN 12
+#define ZBIORNIK_LED_PIN_BLUE  13
+
+// Which diode to target when setting color
+enum Diode { STUDNIA = 0, ZBIORNIK = 1 };
 
 // --- LCD setup ---
 LiquidCrystal_I2C lcd(0x27, 16, 2);
@@ -36,7 +59,8 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 // --- MQTT (HiveMQ) ---
 const char* mqtt_server = "e492dd1e26cf46eb8faf8bf4c19894e2.s1.eu.hivemq.cloud"; // public HiveMQ broker
 const int mqtt_port = 8883;
-const char* mqtt_waterlevel_topic = "esp32/studnia";
+const char* mqtt_waterlevel_studnia_topic = "esp32/studnia";
+const char* mqtt_waterlevel_zbiornik_topic = "esp32/zbiornik";
 const char* mqtt_user = "esp_user";
 const char* mqtt_password = "Rde11#aqaa";
 bool mqtt_subscribed = false;
@@ -46,6 +70,27 @@ void mqttCallback(char* topic, byte* payload, unsigned int length);
 void mqttConnect();
 void mqttReconnect();
 void mqttSubscribeConfig();
+
+// ===== Other Function prototypes =====
+void logger(const String &msg, const String &severity);
+String getFormattedTime();
+void initTimeAndWait();
+void connectToWiFi();
+
+// LCD
+void lcd_init();
+void lcd_print(const String &line1, const String &line2);
+
+// Diodes / LEDs
+void initDiodes();
+void setDiodeColor(const String &colorIn, Diode diode);
+void diodeNotifyWaterLevel(float percentageLevel, Diode diode);
+void testAllColors();
+
+// MQTT handlers
+float getFloatFromKey(const String &msg, const String &key);
+void handleCallbackStudnia(byte* payload, unsigned int length);
+void handleCallbackZbiornik(byte* payload, unsigned int length);
 
 // logger
 void logger(const String &msg, const String &severity = "INFO") {
@@ -126,198 +171,168 @@ void lcd_print(const String &line1, const String &line2) {
 
 // --- LED Diode ---
 
-void initDiode() {
+void initDiodes() {
   ledcSetup(0, 5000, 8);
   ledcSetup(1, 5000, 8);
   ledcSetup(2, 5000, 8);
 
-  ledcAttachPin(PIN_RED, 0);
-  ledcAttachPin(PIN_GREEN, 1);
-  ledcAttachPin(PIN_BLUE, 2);
+  ledcSetup(3, 5000, 8);
+  ledcSetup(4, 5000, 8);
+  ledcSetup(5, 5000, 8);
+
+  ledcAttachPin(STUDNIA_LED_PIN_RED, 0);
+  ledcAttachPin(STUDNIA_LED_PIN_GREEN, 1);
+  ledcAttachPin(STUDNIA_LED_PIN_BLUE, 2);
+
+  ledcAttachPin(ZBIORNIK_LED_PIN_RED, 3);
+  ledcAttachPin(ZBIORNIK_LED_PIN_GREEN, 4);
+  ledcAttachPin(ZBIORNIK_LED_PIN_BLUE, 5);
+
+  setDiodeColor("blue", ZBIORNIK);
+  setDiodeColor("blue", STUDNIA);
 }
 
-void setDiodeColor(String color) {
+// Set a color on one of the two RGB diodes.
+// diodeIndex: 
+// 0 = Studnia (channels 0..2), 
+// 1 = Zbiornik (channels 3..5)
+void setDiodeColor(const String &colorIn, Diode diode = STUDNIA) {
+  String color = colorIn;
   color.toLowerCase();
+  int base = (diode == ZBIORNIK) ? 3 : 0;
+
+  auto writeRGB = [&](int r, int g, int b){
+    ledcWrite(base + 0, r);
+    ledcWrite(base + 1, g);
+    ledcWrite(base + 2, b);
+  };
 
   if (color == "red") {
-    ledcWrite(0, 255);  // R
-    ledcWrite(1, 0);    // G
-    ledcWrite(2, 0);    // B
+    writeRGB(255, 0, 0);
   }
   else if (color == "green") {
-    ledcWrite(0, 0);
-    ledcWrite(1, 255);
-    ledcWrite(2, 0);
+    writeRGB(0, 255, 0);
   }
   else if (color == "blue") {
-    ledcWrite(0, 0);
-    ledcWrite(1, 0);
-    ledcWrite(2, 255);
+    writeRGB(0, 0, 255);
   }
   else if (color == "yellow") {
-    ledcWrite(0, 255);
-    ledcWrite(1, 255);
-    ledcWrite(2, 0);
+    writeRGB(255, 255, 0);
   }
   else if (color == "cyan") {
-    ledcWrite(0, 0);
-    ledcWrite(1, 255);
-    ledcWrite(2, 255);
+    writeRGB(0, 255, 255);
   }
   else if (color == "magenta") {
-    ledcWrite(0, 255);
-    ledcWrite(1, 0);
-    ledcWrite(2, 255);
+    writeRGB(255, 0, 255);
   }
   else if (color == "white") {
-    ledcWrite(0, 255);
-    ledcWrite(1, 255);
-    ledcWrite(2, 255);
+    writeRGB(255, 255, 255);
   }
   else if (color == "off" || color == "black") {
-    ledcWrite(0, 0);
-    ledcWrite(1, 0);
-    ledcWrite(2, 0);
+    writeRGB(0, 0, 0);
   }
   else if (color == "orange") {
-    ledcWrite(0, 255);  // R
-    ledcWrite(1, 165);  // G
-    ledcWrite(2, 0);    // B
+    writeRGB(255, 165, 0);
   }
   else if (color == "purple") {
-    ledcWrite(0, 128);
-    ledcWrite(1, 0);
-    ledcWrite(2, 128);
+    writeRGB(128, 0, 128);
   }
   else if (color == "pink") {
-    ledcWrite(0, 255);
-    ledcWrite(1, 105);
-    ledcWrite(2, 180);
+    writeRGB(255, 105, 180);
   }
   else if (color == "lime") {
-    ledcWrite(0, 191);
-    ledcWrite(1, 255);
-    ledcWrite(2, 0);
+    writeRGB(191, 255, 0);
   }
   else if (color == "aqua") {
-    ledcWrite(0, 0);
-    ledcWrite(1, 255);
-    ledcWrite(2, 255);
+    writeRGB(0, 255, 255);
   }
   else {
-    Serial.println("[WARN] Unknown color: " + color);
+    Serial.println(String("[WARN] Unknown color: ") + color);
   }
 }
 
-void diodeNotifyWaterLevel(float percentageLevel) {
-  const float HYST = 1.0; // hysteresis margin in percent
-
-  logger("diodeNotifyWaterLevel: level=" + String(percentageLevel) + "%, lastState=" +
-         (lastState == RED_S ? "RED" : (lastState == YELLOW_S ? "YELLOW" : "GREEN")), "DEBUG");
-
-  State nextState = lastState;
-
-  if (percentageLevel >= RED_WATER_LEVEL_PERCENTAGE) {
-    logger("Level >= RED threshold (" + String(RED_WATER_LEVEL_PERCENTAGE) + "%)", "DEBUG");
-    nextState = RED_S;
-  } else if (percentageLevel >= YELLOW_WATER_LEVEL_PERCENTAGE) {
-    logger("Level >= YELLOW threshold (" + String(YELLOW_WATER_LEVEL_PERCENTAGE) + "%)", "DEBUG");
-    // If we were RED, stay RED until it falls below RED - HYST
-    if (lastState == RED_S && percentageLevel > (RED_WATER_LEVEL_PERCENTAGE - HYST)) {
-      logger("Hysteresis active: staying RED (level " + String(percentageLevel) +
-             " > RED-HYST " + String(RED_WATER_LEVEL_PERCENTAGE - HYST) + ")", "DEBUG");
-      nextState = RED_S;
-    } else {
-      nextState = YELLOW_S;
-    }
+void diodeNotifyWaterLevel(float percentageLevel, Diode diode) {
+  // update last-notify timestamp for this diode so the timeout watchdog
+  // knows this diode was recently handled
+  if (diode == STUDNIA) {
+    lastNotifyStudnia = millis();
+    studniaTimedOut = false;
   } else {
-    // Below YELLOW threshold
-    logger("Level < YELLOW threshold", "DEBUG");
-    // If we were YELLOW, stay YELLOW until it falls below YELLOW - HYST
-    if (lastState == YELLOW_S && percentageLevel > (YELLOW_WATER_LEVEL_PERCENTAGE - HYST)) {
-      logger("Hysteresis active: staying YELLOW (level " + String(percentageLevel) +
-             " > YELLOW-HYST " + String(YELLOW_WATER_LEVEL_PERCENTAGE - HYST) + ")", "DEBUG");
-      nextState = YELLOW_S;
-    } else {
-      nextState = GREEN_S;
-    }
+    lastNotifyZbiornik = millis();
+    zbiornikTimedOut = false;
   }
 
-  if (nextState != lastState) {
-    logger("State change: " +
-           (lastState == RED_S ? String("RED") : (lastState == YELLOW_S ? String("YELLOW") : String("GREEN"))) +
-           " -> " +
-           (nextState == RED_S ? String("RED") : (nextState == YELLOW_S ? String("YELLOW") : String("GREEN"))),
-           "INFO");
+  String which = (diode == STUDNIA) ? "Studnia" : "Zbiornik";
+  logger("diodeNotifyWaterLevel: " + which + "=" + String(percentageLevel) + "%", "DEBUG");
 
-    switch (nextState) {
-      case RED_S:    setDiodeColor("red");    break;
-      case YELLOW_S: setDiodeColor("yellow"); break;
-      case GREEN_S:  setDiodeColor("green");  break;
+  // calculate next state for this diode only (simplified with hysteresis)
+  auto calcState = [&](float percentage, State last)->State {
+    
+    // up thresholds (apply hysteresis)
+    const float red_up = RED_WATER_LEVEL_PERCENTAGE + HYST;
+    const float yellow_up = YELLOW_WATER_LEVEL_PERCENTAGE + HYST;
+
+    // down thresholds (apply hysteresis)
+    const float red_down = RED_WATER_LEVEL_PERCENTAGE - HYST;
+    const float yellow_down = YELLOW_WATER_LEVEL_PERCENTAGE - HYST;
+
+    // moving up: cross absolute thresholds
+    if (percentage >= red_up) return RED_S;
+    if (percentage >= yellow_up) return YELLOW_S;
+
+    // moving down: stay in higher state until below the lowered threshold
+    if (last == RED_S && percentage >= red_down) return RED_S;
+    if (last == YELLOW_S && percentage >= yellow_down) return YELLOW_S;
+
+    // otherwise we're green
+    return GREEN_S;
+  };
+
+  if (diode == STUDNIA) {
+    State next = calcState(percentageLevel, lastStateStudnia);
+    logger("Studnia set to " +
+           (next == RED_S ? String("RED") : (next == YELLOW_S ? String("YELLOW") : String("GREEN"))),
+           "INFO");
+    switch (next) {
+      case RED_S:    setDiodeColor("red", STUDNIA);    break;
+      case YELLOW_S: setDiodeColor("yellow", STUDNIA); break;
+      case GREEN_S:  setDiodeColor("green", STUDNIA);  break;
     }
-    lastState = nextState;
+    lastStateStudnia = next;
   } else {
-    logger("No state change: remains " +
-           (nextState == RED_S ? String("RED") : (nextState == YELLOW_S ? String("YELLOW") : String("GREEN"))),
-           "DEBUG");
+    State next = calcState(percentageLevel, lastStateZbiornik);
+    logger("Zbiornik set to " +
+           (next == RED_S ? String("RED") : (next == YELLOW_S ? String("YELLOW") : String("GREEN"))),
+           "INFO");
+    switch (next) {
+      case RED_S:    setDiodeColor("red", ZBIORNIK);    break;
+      case YELLOW_S: setDiodeColor("orange", ZBIORNIK); break;
+      case GREEN_S:  setDiodeColor("green", ZBIORNIK);  break;
+    }
+    lastStateZbiornik = next;
   }
 }
 
 void testAllColors() {
-  setDiodeColor("red");
-  delay(3000);
-
-  setDiodeColor("green");
-  delay(3000);
-
-  setDiodeColor("blue");
-  delay(3000);
-
-  setDiodeColor("yellow");
-  delay(3000);
-
-  setDiodeColor("cyan");
-  delay(3000);
-
-  setDiodeColor("magenta");
-  delay(3000);
-
-  setDiodeColor("white");
-  delay(3000);
-
-  setDiodeColor("orange");
-  delay(3000);
-
-  setDiodeColor("purple");
-  delay(3000);
-
-  setDiodeColor("pink");
-  delay(3000);
-
-  setDiodeColor("lime");
-  delay(3000);
-
-  setDiodeColor("aqua");
-  delay(3000);
-
-  setDiodeColor("off");  // wyłączenie diody
+  String colors[] = {"red","green","blue","yellow","cyan","magenta","white","orange","purple","pink","lime","aqua"};
+  // String colors[] = {"red","green","yellow"};
+  for (const String &c : colors) {
+  // set both diodes for the visual test
+  setDiodeColor(c, STUDNIA);
+  setDiodeColor(c, ZBIORNIK);
+    delay(3000);
+  }
+  setDiodeColor("off", STUDNIA);
+  setDiodeColor("off", ZBIORNIK);  // wyłączenie diody
 }
 
 // --- MQTT Connection ---
 
 struct MqttData {
   float waterLevel;
-  float tempSlave;
-  float pressSlave;
-  float tempMaster;
-  float humidityMaster;
-  float pressMaster;
-  String date;
-  String time;
+  float waterLevelPercentage;
   int rssi;
 };
-
-MqttData mqttData;  
 
 float getFloatFromKey(const String &msg, const String &key) {
   int idx = msg.indexOf(key + "\":");
@@ -328,29 +343,44 @@ float getFloatFromKey(const String &msg, const String &key) {
   return msg.substring(start, end).toFloat();
 }
 
+void handleCallbackStudnia(byte* payload, unsigned int length) {
+  String message = String((const char*)payload, length);
+  logger("[MQTT] Studnia topic message received.");
+
+  float waterLevel           = getFloatFromKey(message, "waterLev");
+  float waterLevelPercentage = getFloatFromKey(message, "waterLevPerc");
+
+  lcdData.line1 = "Studnia:  " + String(waterLevelPercentage, 1) + "%";
+  lcd_print(lcdData.line1, lcdData.line2);
+  diodeNotifyWaterLevel(waterLevelPercentage, STUDNIA);
+}
+
+void handleCallbackZbiornik(byte* payload, unsigned int length) {
+  String message = String((const char*)payload, length);
+  logger("[MQTT] Zbiornik topic message received.");
+
+  float waterLevel           = getFloatFromKey(message, "waterLev");
+  float waterLevelPercentage = getFloatFromKey(message, "waterLevPerc");
+
+  lcdData.line2 = "Zbiornik: " + String(waterLevelPercentage, 1) + "%";
+  lcd_print(lcdData.line1, lcdData.line2);
+  diodeNotifyWaterLevel(waterLevelPercentage, ZBIORNIK);
+}
+
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String message = String((const char*)payload, length);
   // logger("[MQTT] Callback invoked. Topic: " + String(topic) + " ,message: " + message);
 
-  mqttData.waterLevel     = getFloatFromKey(message, "waterLevel");
-  mqttData.tempSlave      = getFloatFromKey(message, "tempSlave");
-  mqttData.pressSlave     = getFloatFromKey(message, "pressSlave");
-  mqttData.tempMaster     = getFloatFromKey(message, "tempMaster");
-  mqttData.humidityMaster = getFloatFromKey(message, "humidityMaster");
-  mqttData.pressMaster    = getFloatFromKey(message, "pressMaster");
-  mqttData.rssi           = getFloatFromKey(message, "rssi");
-
-  // logger("waterLevel: " + String(mqttData.waterLevel));
-  // logger("tempSlave: " + String(mqttData.tempSlave));
-  // logger("pressSlave: " + String(mqttData.pressSlave));
-  // logger("tempMaster: " + String(mqttData.tempMaster));
-  // logger("humidityMaster: " + String(mqttData.humidityMaster));
-  // logger("pressMaster: " + String(mqttData.pressMaster));
-  // logger("rssi: " + String(mqttData.rssi));
-
-  float percentageLevel = mqttData.waterLevel / CRITICAL_WATER_LEVEL * 100.0;
-  lcd_print("Studnia: " + String(percentageLevel, 1) + "%", "");
-  diodeNotifyWaterLevel(percentageLevel);
+  if (String(topic) == mqtt_waterlevel_studnia_topic) {
+    handleCallbackStudnia(payload, length);
+  } 
+  else if (String(topic) == mqtt_waterlevel_zbiornik_topic) {
+    handleCallbackZbiornik(payload, length);
+  } 
+  else {
+    logger(String("Unknown topic: ") + String(topic) + " ,message: " + message, "WARN");
+    return;
+  } 
 }
 
 void mqttConnect() {
@@ -362,11 +392,19 @@ void mqttConnect() {
 
 // Subscribe helper: attempts to subscribe to config topic and sets mqtt_subscribed
 void mqttSubscribeConfig() {
-  if (mqttClient.subscribe(mqtt_waterlevel_topic, 0)) {
-    logger(String("Subscribed to topic: ") + String(mqtt_waterlevel_topic));
+  if (mqttClient.subscribe(mqtt_waterlevel_studnia_topic, 0)) {
+    logger(String("Subscribed to topic: ") + String(mqtt_waterlevel_studnia_topic));
     mqtt_subscribed = true;
   } else {
-    logger(String("Failed to subscribe to topic: ") + String(mqtt_waterlevel_topic), "WARN");
+    logger(String("Failed to subscribe to topic: ") + String(mqtt_waterlevel_studnia_topic), "WARN");
+    mqtt_subscribed = false;
+  }
+
+  if (mqttClient.subscribe(mqtt_waterlevel_zbiornik_topic, 0)) {
+    logger(String("Subscribed to topic: ") + String(mqtt_waterlevel_zbiornik_topic));
+    mqtt_subscribed = true;
+  } else {
+    logger(String("Failed to subscribe to topic: ") + String(mqtt_waterlevel_zbiornik_topic), "WARN");
     mqtt_subscribed = false;
   }
 }
@@ -384,43 +422,91 @@ void mqttReconnect() {
   }
 }
 
+void initOTA() {
+  ArduinoOTA.setHostname(host);
+
+  ArduinoOTA
+    .onStart([]() {
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH)
+        type = "sketch";
+      else // U_SPIFFS
+        type = "filesystem";
+      Serial.println("Start initialization " + type);
+    })
+    .onEnd([]() {
+      Serial.println("\nInit done!");
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("Blad[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+      else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    });
+
+  ArduinoOTA.begin();
+  Serial.println("[INFO] OTA ready.");
+}
 
 void setup() {
   lcd_init();
   lcd_print("ESP32", "Initializing...");
 
-  memory.begin("myApp", false); 
-
-  // float tempValue = 23.45;
-  // preferences.putFloat("temp", tempValue);
-  // preferences.putString("name", "ESP32");
+  initDiodes();
 
   logger("Initializing...");
   espClient.setInsecure(); // disables certificate verification
-
-  initDiode();
-  testAllColors();
 
   Serial.begin(115200);
   connectToWiFi();
   initTimeAndWait();
 
+  initOTA();
+  // initialize notify timestamps to now to avoid immediate timeout
+  lastNotifyStudnia = millis();
+  lastNotifyZbiornik = millis();
+
+  // testAllColors();
+
   mqttConnect();
 
-  // odczyt pamieci
-  // memory.clear(); // odkomentuj, aby wyczyscic pamiec
-  // float tempRead = memory.getFloat("temp", 0.0);
-  // Serial.println("Odczyt temp: " + String(tempRead));
-  // String nameRead = memory.getString("name", "unknown");
-  // Serial.println("Odczyt name: " + nameRead);
+  lcdData.line1 = "Studnia:  N/A";
+  lcdData.line2 = "Zbiornik: N/A";
+  lcd_print(lcdData.line1, lcdData.line2);
+}
+
+void statusWatchdog() {
+  // watchdog: if no diodeNotifyWaterLevel was called for a diode for more than
+  // NOTIFY_TIMEOUT_MS, set that diode to blue to indicate stale data.
+  unsigned long now = millis();
+  if (!studniaTimedOut && (now - lastNotifyStudnia > NOTIFY_TIMEOUT_MS)) {
+    logger("Studnia has not been updated for >60s, forcing BLUE color", "WARN");
+    setDiodeColor("blue", STUDNIA);
+    studniaTimedOut = true;
+    lcdData.line1 = lcdData.line1 + "?";
+    lcd_print(lcdData.line1, lcdData.line2);
+  }
+  if (!zbiornikTimedOut && (now - lastNotifyZbiornik > NOTIFY_TIMEOUT_MS)) {
+    logger("Zbiornik has not been updated for >60s, forcing BLUE color", "WARN");
+    setDiodeColor("blue", ZBIORNIK);
+    zbiornikTimedOut = true;
+    lcdData.line2 = lcdData.line2 + "?";
+    lcd_print(lcdData.line1, lcdData.line2);
+  }
 }
 
 void loop() {
+
+  ArduinoOTA.handle();
 
   if (!mqttClient.connected()) {
     mqttReconnect();
   }
   mqttClient.loop();
+
+  statusWatchdog();
 
   if(WiFi.status() != WL_CONNECTED) {
     logger("WiFi disconnected, reconnecting...");
@@ -431,7 +517,5 @@ void loop() {
     logger("MQTT internal state changed: " + String(mqttClient.state()));
   }
 
-  // lcd.scrollDisplayLeft();
-  // delay(300);
-  delay(50);
+  delay(100);
 }
