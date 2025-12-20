@@ -11,8 +11,8 @@
 #include <ArduinoOTA.h>
 
 // thresholds are percentages (0..100)
-const float YELLOW_WATER_LEVEL_PERCENTAGE = 0.02; // %
-const float RED_WATER_LEVEL_PERCENTAGE    = 0.05; // %
+const float YELLOW_WATER_LEVEL_PERCENTAGE = 70; // %
+const float RED_WATER_LEVEL_PERCENTAGE    = 90; // %
 const float HYST = 0.01; // hysteresis margin in percent
 const unsigned long NOTIFY_TIMEOUT_MS = 60ul * 1000ul; // 60 seconds
 
@@ -35,9 +35,15 @@ static bool studniaTimedOut = false;
 static bool zbiornikTimedOut = false;
 
 // --- WiFi ---
-const char* ssid = "4M";
-const char* password = "Shxt-313";
+// const char* ssid = "4M";
+// const char* password = "Shxt-313";
 const char* host = "esp32-updater-lcd-monitoring";
+const char* ssid = "Mnet_0";
+const char* password = "Vgt15rst";
+
+WiFiServer telnetServer(23);
+WiFiClient telnetClient;
+WiFiClientSecure espClient;
 
 // --- LED diode ---
 #define STUDNIA_LED_PIN_RED   18
@@ -65,6 +71,8 @@ const char* mqtt_user = "esp_user";
 const char* mqtt_password = "Rde11#aqaa";
 bool mqtt_subscribed = false;
 
+PubSubClient mqttClient(espClient);
+
 // ===== MQTT Function prototypes =====
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void mqttConnect();
@@ -79,7 +87,7 @@ void connectToWiFi();
 
 // LCD
 void lcd_init();
-void lcd_print(const String &line1, const String &line2);
+void lcd_print(const lcdDataStruct &lcdData);
 
 // Diodes / LEDs
 void initDiodes();
@@ -96,6 +104,7 @@ void handleCallbackZbiornik(byte* payload, unsigned int length);
 void logger(const String &msg, const String &severity = "INFO") {
   String formatted = String("[") + severity + "] " + msg;
   Serial.println(formatted);
+  telnetClient.println(formatted);
 }
 
 // --- NTP Functions ---
@@ -128,9 +137,6 @@ void initTimeAndWait() {
   }
 }
 
-WiFiClientSecure espClient;
-PubSubClient mqttClient(espClient);
-
 void connectToWiFi() {
   // WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS);
   WiFi.begin(ssid, password);
@@ -153,14 +159,14 @@ void lcd_init() {
   lcd.clear();
 }
 
-void lcd_print(const String &line1, const String &line2) {
+void lcd_print(const lcdDataStruct &data) {
   lcd.clear();
 
   // cut to 16 chars
-  String l1 = line1;
+  String l1 = data.line1;
   if (l1.length() > 16) l1 = l1.substring(0, 16);
 
-  String l2 = line2;
+  String l2 = data.line2;
   if (l2.length() > 16) l2 = l2.substring(0, 16);
 
   lcd.setCursor(0, 0);
@@ -350,8 +356,8 @@ void handleCallbackStudnia(byte* payload, unsigned int length) {
   float waterLevel           = getFloatFromKey(message, "waterLev");
   float waterLevelPercentage = getFloatFromKey(message, "waterLevPerc");
 
-  lcdData.line1 = "Studnia:  " + String(waterLevelPercentage, 1) + "%";
-  lcd_print(lcdData.line1, lcdData.line2);
+  lcdData.line1 = "STUDNIA:  " + String(waterLevelPercentage, 1) + "%";
+  lcd_print(lcdData);
   diodeNotifyWaterLevel(waterLevelPercentage, STUDNIA);
 }
 
@@ -362,8 +368,8 @@ void handleCallbackZbiornik(byte* payload, unsigned int length) {
   float waterLevel           = getFloatFromKey(message, "waterLev");
   float waterLevelPercentage = getFloatFromKey(message, "waterLevPerc");
 
-  lcdData.line2 = "Zbiornik: " + String(waterLevelPercentage, 1) + "%";
-  lcd_print(lcdData.line1, lcdData.line2);
+  lcdData.line2 = "ZBIORNIK: " + String(waterLevelPercentage, 1) + "%";
+  lcd_print(lcdData);
   diodeNotifyWaterLevel(waterLevelPercentage, ZBIORNIK);
 }
 
@@ -450,9 +456,28 @@ void initOTA() {
   Serial.println("[INFO] OTA ready.");
 }
 
+void setupTelnet() {
+  telnetServer.begin();
+  telnetServer.setNoDelay(true);
+  logger("Telnet server started on port 23");
+}
+
+void telnetLoop() {
+  if (telnetServer.hasClient()) {
+    if (!telnetClient || !telnetClient.connected()) {
+      telnetClient = telnetServer.available();
+      telnetClient.println("Connected to ESP32 Telnet");
+    } else {
+      telnetServer.available().stop(); // tylko jeden klient
+    }
+  }
+}
+
 void setup() {
   lcd_init();
-  lcd_print("ESP32", "Initializing...");
+  lcdData.line1 = "ESP32";
+  lcdData.line2 = "Initializing...";
+  lcd_print(lcdData);
 
   initDiodes();
 
@@ -472,9 +497,11 @@ void setup() {
 
   mqttConnect();
 
-  lcdData.line1 = "Studnia:  N/A";
-  lcdData.line2 = "Zbiornik: N/A";
-  lcd_print(lcdData.line1, lcdData.line2);
+  lcdData.line1 = "STUDNIA:  N/A";
+  lcdData.line2 = "ZBIORNIK: N/A";
+  lcd_print(lcdData);
+
+  setupTelnet();
 }
 
 void statusWatchdog() {
@@ -486,20 +513,22 @@ void statusWatchdog() {
     setDiodeColor("blue", STUDNIA);
     studniaTimedOut = true;
     lcdData.line1 = lcdData.line1 + "?";
-    lcd_print(lcdData.line1, lcdData.line2);
+    lcd_print(lcdData);
   }
   if (!zbiornikTimedOut && (now - lastNotifyZbiornik > NOTIFY_TIMEOUT_MS)) {
     logger("Zbiornik has not been updated for >60s, forcing BLUE color", "WARN");
     setDiodeColor("blue", ZBIORNIK);
     zbiornikTimedOut = true;
     lcdData.line2 = lcdData.line2 + "?";
-    lcd_print(lcdData.line1, lcdData.line2);
+    lcd_print(lcdData);
   }
 }
 
 void loop() {
 
   ArduinoOTA.handle();
+
+  telnetLoop();
 
   if (!mqttClient.connected()) {
     mqttReconnect();
