@@ -24,6 +24,10 @@ float previousWaterLevel = 0.0;
 int readSlaveSensorCounter = 0;
 float currentWaterSpeedPerHour = 0.0;
 
+// Non-blocking slave reset tracking
+unsigned long lastSlaveResetMs = 0;
+bool waitingForSlaveReboot = false;
+
 float maxRecordedWaterLevel = 0.0;
 float minRecordedWaterLevel = 0.0;
 float maxRecordedWaterIncreaseSpeed = 0.0;
@@ -35,9 +39,7 @@ String minRecordedWaterLevelDate = "N/A";
 String maxRecordedWaterIncreaseSpeedDate = "N/A";
 String maxRecordedWaterDecreaseSpeedDate = "N/A";  
 
-
 // Preferences for storing stats
-
 Preferences memory;
 void resetMemory();
 void readMemory();
@@ -47,7 +49,7 @@ void readMemory();
 #define TX_PIN 16 // DI
 #define RE_DE_PIN 5
 #define UART_BAUD 9600
-HardwareSerial uartToSlaveESP(1);
+HardwareSerial uartToSlaveESP(1); // Use UART1
 
 // ======================= BMP280 Sensor Setup =====================
 #define BMP280_PIN_SDA 22   // SDA
@@ -76,8 +78,8 @@ const char* mqtt_user = "esp_user";
 const char* mqtt_password = "Rde11#aqaa";
 bool mqtt_subscribed = false;
 // forward logs to MQTT when true
-bool mqtt_enable_master_logs = false;
-bool mqtt_enable_slave_logs = false;
+bool mqtt_enable_master_logs = true;
+bool mqtt_enable_slave_logs = true;
 
 // ===== MQTT Function prototypes =====
 void mqttCallback(char* topic, byte* payload, unsigned int length);
@@ -94,6 +96,8 @@ void initTime() {
 
 WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
+WiFiServer telnetServer(23);
+WiFiClient telnetClient;
 
 String getFormattedTime() {
   struct tm timeinfo;
@@ -110,11 +114,12 @@ String getFormattedTime() {
 void logger(const String &msg, const String &severity = "INFO") {
   String formatted = String("[") + severity + "] " + msg;
   Serial.println(formatted);
+  telnetClient.println(formatted);
   if (mqttClient.connected() && mqtt_enable_master_logs) {
     String now = getFormattedTime();
     // Build JSON payload with time and log fields
     String payload = String("{\"time\":\"") + now + String("\",\"log\":\"") + formatted + String("\"}");
-    mqttClient.publish(mqtt_logs_topic, payload.c_str());
+    mqttClient.publish(mqtt_logs_topic, payload.c_str(), true);
   }
 }
 
@@ -246,7 +251,7 @@ void publishLogToMQTT(const String &logMessage) {
   String payload = "{\"log\":\"" + fullMessage + "\"}";
 
   if (mqttClient.connected()) {
-    mqttClient.publish(mqtt_logs_topic, payload.c_str());
+    mqttClient.publish(mqtt_logs_topic, payload.c_str(), true);
     // keep local-only prints here to avoid double-forwarding via logger
     Serial.println("Sent log to MQTT topic: " + String(mqtt_logs_topic));
     Serial.println("Log Payload: " + payload);
@@ -350,7 +355,7 @@ void mqttPublishWaterLevelAndSensors(float tempValue_slave, float pressValue_sla
 
   // send to MQTT
   if (mqttClient.connected()) {
-    mqttClient.publish(mqtt_waterlevel_topic, payload.c_str());
+    mqttClient.publish(mqtt_waterlevel_topic, payload.c_str(), true);
     // logger("Send to MQTT topic: " + String(mqtt_waterlevel_topic));
     logger("MQTT Payload: " + payload);
   } else {
@@ -381,7 +386,7 @@ void mqttPublishWaterLevelStats() {
 
   // send to MQTT
   if (mqttClient.connected()) {
-    mqttClient.publish(mqtt_waterlevel_stats_topic, payload.c_str());
+    mqttClient.publish(mqtt_waterlevel_stats_topic, payload.c_str(), true);
     // logger("Send to MQTT topic: " + String(mqtt_waterlevel_topic));
     logger("MQTT Payload: " + payload);
   } else {
@@ -401,10 +406,23 @@ void printPendingSlaveMessages() {
   }
 }
 
-void initUartToSlave() {  
-  uartToSlaveESP.begin(UART_BAUD, SERIAL_8N1, RX_PIN, TX_PIN);
+bool initUartToSlave() {  
+  // Prepare RE/DE pin for RS485 direction control
   pinMode(RE_DE_PIN, OUTPUT);
-  digitalWrite(RE_DE_PIN, LOW); // Set RE/DE low to receive
+  digitalWrite(RE_DE_PIN, LOW); // Set RE/DE low to receive by default
+
+  // Single (non-retry) initialization attempt
+  uartToSlaveESP.begin(UART_BAUD, SERIAL_8N1, RX_PIN, TX_PIN);
+  // short wait to let driver settle
+  delay(10);
+
+  if (uartToSlaveESP) {
+    logger("UART to slave initialized.");
+    return true;
+  }
+
+  logger("Failed to initialize UART to slave.", "ERROR");
+  return false;
 }
 
 std::tuple<float, float, float> readMasterSensors() {
@@ -449,25 +467,48 @@ void writeSlaveCommand(const String &cmd) {
   digitalWrite(RE_DE_PIN, LOW);
   logger("[MASTER] Send command: " + cmd);
 
-  if(cmd == "RESET")
-  {
-      // wait for slave to reboot
-      delay(30000);
+  // For RESET, don't block the main loop with a long delay.
+  // Instead, mark that we're waiting for the slave to reboot and
+  // let the main loop skip reads until the timeout elapses.
+  if (cmd == "RESET") {
+    waitingForSlaveReboot = true;
+    lastSlaveResetMs = millis();
+    logger("[MASTER] RESET requested; entering non-blocking wait for slave reboot.");
   }
 }
 
 void readSlaveSensors() {
+  // Skip reading slave if UART driver/object isn't available
+  if (!uartToSlaveESP) {
+    logger("[MASTER] UART to slave not available; skipping readSlaveSensors.", "WARN");
+    return;
+  }
   readSlaveSensorCounter++;
 
   printPendingSlaveMessages();
+
+  // If we recently sent a RESET to the slave, wait non-blocking for it to come back up.
+  if (waitingForSlaveReboot) {
+    unsigned long now = millis();
+    const unsigned long SLAVE_REBOOT_WAIT_MS = 30000UL;
+    if (now - lastSlaveResetMs < SLAVE_REBOOT_WAIT_MS) {
+      // Still waiting; skip attempting to contact the slave.
+      logger("[MASTER] Waiting for slave reboot...", "DEBUG");
+      return;
+    } else {
+      // Wait completed
+      waitingForSlaveReboot = false;
+      logger("[MASTER] Slave reboot wait elapsed; resuming communication.", "INFO");
+    }
+  }
   writeSlaveCommand("ALL");
 
   // wait for response
   delay(100); // ms
 
   if(!uartToSlaveESP.available()) {
-    logger("[ESP8266] No response.", "WARN");
-    writeSlaveCommand("RESET");
+    logger("[SLAVE] No response.", "ERROR");
+    // writeSlaveCommand("RESET");
     return;
   }
 
@@ -586,28 +627,51 @@ void initOTA() {
   Serial.println("[INFO] OTA ready.");
 }
 
+void setupTelnet() {
+  telnetServer.begin();
+  telnetServer.setNoDelay(true);
+  logger("Telnet server started on port 23");
+}
+
+void telnetLoop() {
+  if (telnetServer.hasClient()) {
+    if (!telnetClient || !telnetClient.connected()) {
+      telnetClient = telnetServer.available();
+      telnetClient.println("Connected to ESP32 Telnet");
+    } else {
+      telnetServer.available().stop(); // tylko jeden klient
+    }
+  }
+}
+
 void setup() {
+  Serial.begin(115200);
+  // Ensure serial is up before using logger so early startup messages are visible
   logger("Initializing...");
   espClient.setInsecure(); // disables certificate verification
 
   memory.begin("myApp", false); 
   readMemory();
 
-  Serial.begin(115200);
-  initUartToSlave();
+  connectToWiFi();
   initTime();
 
-  initBmp280Aht20();
-
-  connectToWiFi();
   initOTA();
+  setupTelnet();
+
+  // Initialize UART to slave (initUartToSlave does internal retries)
+  if (!initUartToSlave()) {
+    logger("UART to slave failed to initialize; slave reads will be skipped.", "ERROR");
+  }
+  initBmp280Aht20();
 
   mqttConnect();
 }
 
 void loop() {
-
   ArduinoOTA.handle();
+
+  telnetLoop();
 
   if (!mqttClient.connected()) {
     mqttReconnect();
